@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sports-projection"
+version = "0.1.0"
+description = "Prototype NBA game projection and betting value dashboard"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.13.5",
+    "bs4>=0.0.2",
+    "duckdb>=1.5.2",
+    "fastapi[standard]>=0.136.0",
+    "joblib>=1.5.3",
+    "nba-api>=1.11.4",
+    "nicegui>=3.10.0",
+    "pandas>=3.0.2",
+    "polars>=1.40.0",
+    "python-dotenv>=1.2.2",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
+    "sqlalchemy>=2.0.49",
+    "xgboost>=3.2.0",
+]
+
+[project.scripts]
+sports-projection = "src.cli:main"
+sports-dashboard = "src.cli:dashboard"
+sports-test = "src.cli:test"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
