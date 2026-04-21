@@ -14,6 +14,11 @@ NBA projections and betting value dashboard built with `uv`, `polars`, `nba_api`
   - implied probability
   - edge
   - expected value (EV)
+- supports a trained XGBoost projection model using:
+  - recent form
+  - season-long form
+  - rest / back-to-back features
+  - pace and margin features
 - shows everything in a NiceGUI dashboard with filters
 - falls back to mock data when live data is unavailable
 
@@ -37,11 +42,34 @@ Run the dashboard:
 uv run sports-dashboard
 ```
 
+Train the model artifact:
+
+```bash
+uv run sports-train
+```
+
 Run tests:
 
 ```bash
 uv run sports-test
 ```
+
+## Model training
+
+The trained model uses historical NBA games to build pregame features such as:
+
+- recent offense / defense
+- recent margin
+- recent pace
+- season offense / defense
+- season margin
+- season pace
+- rest days
+- back-to-back flags
+- team form differentials
+
+Training persists a model artifact to `artifacts/nba_projection_model.joblib`.
+The live pipeline and dashboard can use this trained model when auto-training is enabled.
 
 ## Dashboard features
 
@@ -92,6 +120,7 @@ Defined in `pyproject.toml`:
 ```bash
 uv run sports-projection
 uv run sports-dashboard
+uv run sports-train
 uv run sports-test
 ```
 
@@ -99,7 +128,8 @@ uv run sports-test
 
 - `src/data/nba_fetcher.py` – live NBA schedule + merged odds + team form
 - `src/data/odds_providers.py` – odds providers and normalization
-- `src/models/advanced_engine.py` – projection engine
+- `src/models/advanced_engine.py` – projection engine / trained-model fallback logic
+- `src/models/trained_nba_model.py` – historical feature engineering and XGBoost training
 - `src/models/value_engine.py` – implied probability, edge, EV math
 - `src/ui/main_ui.py` – NiceGUI dashboard
 - `src/pipeline.py` – terminal pipeline entry logic

@@ -141,7 +141,7 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(row["market_odds"], -650)
 
     def test_dashboard_data_contains_market_and_edge_columns(self):
-        app = SportsApp()
+        app = SportsApp(auto_train=False, use_live_data=False)
         app.refresh_data()
         self.assertIn("market_source", app.results_df.columns)
         self.assertIn("market_provider", app.results_df.columns)
@@ -150,9 +150,12 @@ class UtilityTests(unittest.TestCase):
         self.assertIn("market_total", app.results_df.columns)
         self.assertIn("implied_probability", app.results_df.columns)
         self.assertIn("edge", app.results_df.columns)
+        self.assertIn("model_margin_source", app.results_df.columns)
+        self.assertIn("model_margin_mae", app.results_df.columns)
+        self.assertIn("model_total_mae", app.results_df.columns)
 
     def test_dashboard_filters_positive_ev_and_min_edge(self):
-        app = SportsApp()
+        app = SportsApp(auto_train=False, use_live_data=False)
         app.results_df = pl.DataFrame(
             [
                 {"matchup": "A @ B", "expected_value": 0.10, "edge": 0.08, "market_source": "X", "game_date": "2026-04-21"},
@@ -172,7 +175,7 @@ class UtilityTests(unittest.TestCase):
 
 class PipelineTests(unittest.TestCase):
     def test_full_pipeline_returns_sorted_report(self):
-        report = run_full_pipeline()
+        report = run_full_pipeline(auto_train=False, use_live_data=False)
         self.assertGreater(report.height, 0)
         evs = report["expected_value"].to_list()
         self.assertEqual(evs, sorted(evs, reverse=True))

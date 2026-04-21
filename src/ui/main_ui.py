@@ -29,9 +29,13 @@ def resolve_port(preferred_port: int) -> int:
 
 
 class SportsApp:
-    def __init__(self):
+    def __init__(self, auto_train: bool = True, use_live_data: bool = True):
         self.fetcher = NBAFetcher()
-        self.proj_engine = AdvancedModelingEngine()
+        self.use_live_data = use_live_data
+        self.proj_engine = AdvancedModelingEngine(
+            auto_train=auto_train,
+            use_trained_model=auto_train,
+        )
         self.value_engine = ValueEngine()
         self.games_df = pl.DataFrame()
         self.results_df = pl.DataFrame()
@@ -44,16 +48,17 @@ class SportsApp:
         self.selected_date = "All"
 
     def _load_games(self) -> tuple[pl.DataFrame, str]:
-        try:
-            real_games = self.fetcher.get_upcoming_games_with_context(days_ahead=7)
-            if not real_games.is_empty():
-                odds_source = real_games.get_column("market_source").drop_nulls().unique().to_list()
-                source_label = "live nba_api"
-                if odds_source:
-                    source_label += f" + odds ({', '.join(str(x) for x in odds_source)})"
-                return real_games, source_label
-        except Exception:
-            pass
+        if self.use_live_data:
+            try:
+                real_games = self.fetcher.get_upcoming_games_with_context(days_ahead=7)
+                if not real_games.is_empty():
+                    odds_source = real_games.get_column("market_source").drop_nulls().unique().to_list()
+                    source_label = "live nba_api"
+                    if odds_source:
+                        source_label += f" + odds ({', '.join(str(x) for x in odds_source)})"
+                    return real_games, source_label
+            except Exception:
+                pass
 
         mock_games = pl.DataFrame(
             [
@@ -209,6 +214,13 @@ class SportsApp:
         except (TypeError, ValueError):
             return str(value)
 
+    @staticmethod
+    def _first_non_null(df: pl.DataFrame, column: str):
+        if df.is_empty() or column not in df.columns:
+            return None
+        values = df.get_column(column).drop_nulls().to_list()
+        return values[0] if values else None
+
     def render_ui(self):
         filtered_df = self.get_filtered_results()
 
@@ -217,12 +229,26 @@ class SportsApp:
         else:
             self.container_column = ui.column().classes("w-full items-center p-4")
 
+        model_source = self._first_non_null(filtered_df, "model_margin_source") or self._first_non_null(
+            self.results_df, "model_margin_source"
+        ) or "—"
+        model_margin_mae = self._first_non_null(filtered_df, "model_margin_mae") or self._first_non_null(
+            self.results_df, "model_margin_mae"
+        )
+        model_total_mae = self._first_non_null(filtered_df, "model_total_mae") or self._first_non_null(
+            self.results_df, "model_total_mae"
+        )
+        model_trained_at = self._first_non_null(filtered_df, "model_trained_at") or self._first_non_null(
+            self.results_df, "model_trained_at"
+        )
+
         with self.container_column:
             ui.label("Sports Projection Dashboard").classes("text-4xl font-bold mb-2")
             ui.label("Real NBA schedule when available, mock fallback otherwise").classes(
                 "text-gray-500 mb-2"
             )
-            ui.label(f"Data source: {self.data_source}").classes("text-sm text-blue-600 mb-6")
+            ui.label(f"Data source: {self.data_source}").classes("text-sm text-blue-600 mb-2")
+            ui.label(f"Projection model: {model_source}").classes("text-sm text-purple-600 mb-6")
 
             with ui.card().classes("w-full max-w-[1500px] p-4 mb-6"):
                 ui.label("Filters").classes("text-lg font-semibold mb-3")
@@ -269,6 +295,18 @@ class SportsApp:
                     ui.label("Best Edge").classes("text-xs uppercase text-gray-400")
                     best_edge = filtered_df["edge"].max() if not filtered_df.is_empty() else 0
                     ui.label(f"{best_edge:.1%}").classes("text-2xl font-bold text-blue-500")
+                with ui.card().classes("p-4 w-40"):
+                    ui.label("Model Source").classes("text-xs uppercase text-gray-400")
+                    ui.label(str(model_source)).classes("text-sm font-bold")
+                with ui.card().classes("p-4 w-40"):
+                    ui.label("Margin MAE").classes("text-xs uppercase text-gray-400")
+                    ui.label(self._format_optional_number(model_margin_mae, 2)).classes("text-2xl font-bold")
+                with ui.card().classes("p-4 w-40"):
+                    ui.label("Total MAE").classes("text-xs uppercase text-gray-400")
+                    ui.label(self._format_optional_number(model_total_mae, 2)).classes("text-2xl font-bold")
+
+            if model_trained_at is not None:
+                ui.label(f"Model trained at: {model_trained_at}").classes("text-xs text-gray-500 mb-4")
 
             ui.label("Upcoming Market Opportunities").classes("text-xl font-semibold mb-2")
 

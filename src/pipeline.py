@@ -16,16 +16,19 @@ def build_mock_schedule() -> pl.DataFrame:
     )
 
 
-def run_full_pipeline() -> pl.DataFrame:
+def run_full_pipeline(auto_train: bool = True, use_live_data: bool = True) -> pl.DataFrame:
     print("--- Starting Full Sports Projection Pipeline ---")
 
-    proj_engine = AdvancedModelingEngine()
+    proj_engine = AdvancedModelingEngine(auto_train=auto_train, use_trained_model=auto_train)
     value_engine = ValueEngine()
     fetcher = NBAFetcher()
 
-    try:
-        upcoming_df = fetcher.get_upcoming_games_with_context(days_ahead=7)
-    except Exception:
+    if use_live_data:
+        try:
+            upcoming_df = fetcher.get_upcoming_games_with_context(days_ahead=7)
+        except Exception:
+            upcoming_df = pl.DataFrame()
+    else:
         upcoming_df = pl.DataFrame()
 
     data_source = "live nba_api"

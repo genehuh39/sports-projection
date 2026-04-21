@@ -1,12 +1,21 @@
 import numpy as np
 import polars as pl
 
+from src.models.trained_nba_model import NBAModelManager
+
 
 class AdvancedModelingEngine:
-    """Generates game projections from either real team context or fallback heuristics."""
+    """Generates game projections from a trained model when available, otherwise falls back."""
 
-    def __init__(self, monte_carlo_sims: int = 1000):
+    def __init__(
+        self,
+        monte_carlo_sims: int = 1000,
+        auto_train: bool = False,
+        use_trained_model: bool = False,
+    ):
         self.sims = monte_carlo_sims
+        self.use_trained_model = use_trained_model
+        self.model_manager = NBAModelManager(auto_train=auto_train)
 
     def simulate_player_performance(self, player_stats: dict, minutes_available: float) -> dict:
         base_rate = player_stats.get("ppg", 20.0)
@@ -22,8 +31,7 @@ class AdvancedModelingEngine:
             "assists": np.random.poisson(player_stats.get("apg", 5)) * scale_factor,
         }
 
-    def generate_projections(self, upcoming_df: pl.DataFrame) -> pl.DataFrame:
-        """Generates projections for upcoming games."""
+    def _fallback_projections(self, upcoming_df: pl.DataFrame) -> pl.DataFrame:
         home_fallback = (
             pl.lit(105.0)
             + (pl.col("home_team_id").cast(pl.Utf8).hash().cast(pl.Float64) % 15)
@@ -58,12 +66,26 @@ class AdvancedModelingEngine:
             home_expected = home_fallback
             away_expected = away_fallback
 
-        projections = upcoming_df.with_columns(
+        return upcoming_df.with_columns(
             [
                 home_expected.alias("home_expected_score"),
                 away_expected.alias("away_expected_score"),
+                pl.lit("heuristic").alias("model_margin_source"),
+                pl.lit(None).cast(pl.Utf8).alias("model_trained_at"),
+                pl.lit(None).cast(pl.Float64).alias("model_margin_mae"),
+                pl.lit(None).cast(pl.Float64).alias("model_total_mae"),
             ]
-        ).with_columns(
+        )
+
+    def generate_projections(self, upcoming_df: pl.DataFrame) -> pl.DataFrame:
+        """Generates projections for upcoming games."""
+        projections = None
+        if self.use_trained_model:
+            projections = self.model_manager.predict_games(upcoming_df)
+        if projections is None or projections.is_empty():
+            projections = self._fallback_projections(upcoming_df)
+
+        projections = projections.with_columns(
             [
                 (pl.col("home_expected_score") - pl.col("away_expected_score")).alias(
                     "expected_margin"
