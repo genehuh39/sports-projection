@@ -28,6 +28,7 @@ dependencies = [
 [project.scripts]
 sports-projection = "src.cli:main"
 sports-dashboard = "src.cli:dashboard"
+sports-train = "src.cli:train"
 sports-test = "src.cli:test"
 
 [tool.setuptools.packages.find]

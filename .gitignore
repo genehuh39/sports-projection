@@ -45,6 +45,7 @@ Thumbs.db
 *.log
 *.sqlite
 *.db
+artifacts/
 
 # UV
 .uv/
