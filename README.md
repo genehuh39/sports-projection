@@ -77,7 +77,6 @@ The dashboard currently shows:
 
 - matchup
 - game date
-- odds provider
 - bookmaker
 - projected home / away score
 - model win probability

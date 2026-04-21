@@ -310,13 +310,12 @@ class SportsApp:
 
             ui.label("Upcoming Market Opportunities").classes("text-xl font-semibold mb-2")
 
-            with ui.card().classes("w-full max-w-[2100px] overflow-x-auto"):
+            with ui.card().classes("w-full max-w-[2000px] overflow-x-auto"):
                 with ui.element("div").classes(
-                    "w-full min-w-[1750px] grid grid-cols-13 gap-3 bg-gray-100 p-3 font-bold border-b items-center"
+                    "w-full min-w-[1600px] grid grid-cols-12 gap-3 bg-gray-100 p-3 font-bold border-b items-center"
                 ):
                     ui.label("Matchup")
                     ui.label("Date")
-                    ui.label("Provider")
                     ui.label("Bookmaker")
                     ui.label("Home Exp")
                     ui.label("Away Exp")
@@ -332,11 +331,10 @@ class SportsApp:
                     ev_color = "text-green-600" if row["expected_value"] > 0 else "text-red-600"
                     edge_color = "text-green-600" if row["edge"] > 0 else "text-red-600"
                     with ui.element("div").classes(
-                        "w-full min-w-[1750px] grid grid-cols-13 gap-3 p-3 border-b hover:bg-gray-50 items-center"
+                        "w-full min-w-[1600px] grid grid-cols-12 gap-3 p-3 border-b hover:bg-gray-50 items-center"
                     ):
                         ui.label(row["matchup"]).classes("font-medium")
                         ui.label(str(row.get("game_date") or "—")).classes("text-sm text-gray-600")
-                        ui.label(str(row.get("market_provider") or "—")).classes("text-sm text-gray-600")
                         ui.label(str(row.get("market_bookmaker") or "—")).classes("text-sm text-gray-600")
                         ui.label(f"{row['home_expected_score']:.1f}")
                         ui.label(f"{row['away_expected_score']:.1f}")
