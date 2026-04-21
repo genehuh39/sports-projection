@@ -140,3 +140,7 @@ uv run sports-test
 - current EV is based on the home-side moneyline
 - the model is still lightweight and based mainly on recent scoring context
 - bookmaker coverage depends on source availability for a given game
+
+## License
+
+MIT
