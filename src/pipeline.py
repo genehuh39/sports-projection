@@ -19,7 +19,11 @@ def build_mock_schedule() -> pl.DataFrame:
 def run_full_pipeline(auto_train: bool = True, use_live_data: bool = True) -> pl.DataFrame:
     print("--- Starting Full Sports Projection Pipeline ---")
 
-    proj_engine = AdvancedModelingEngine(auto_train=auto_train, use_trained_model=auto_train)
+    proj_engine = AdvancedModelingEngine(
+        auto_train=auto_train,
+        use_trained_model=auto_train,
+        apply_injury_adjustment=use_live_data,
+    )
     value_engine = ValueEngine()
     fetcher = NBAFetcher()
 
