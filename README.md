@@ -24,6 +24,12 @@ NBA projections and betting value dashboard built with `uv`, `polars`, `nba_api`
 
 ## Quick start
 
+On macOS, install the OpenMP runtime that XGBoost requires:
+
+```bash
+brew install libomp
+```
+
 Install dependencies:
 
 ```bash
