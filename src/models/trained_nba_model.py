@@ -153,6 +153,85 @@ class NBAModelManager:
                 lambda s: self._shifted_expanding_mean(s, min_periods=5)
             ).reset_index(level=0, drop=True)
 
+        df = self._add_srs_pre(df)
+
+        return df
+
+    @staticmethod
+    def _solve_srs(
+        home_ids: np.ndarray,
+        away_ids: np.ndarray,
+        home_margins: np.ndarray,
+        max_iter: int = 25,
+        tol: float = 0.01,
+    ) -> dict[int, float]:
+        teams = np.unique(np.concatenate([home_ids, away_ids]))
+        if teams.size == 0:
+            return {}
+        idx_of = {int(t): i for i, t in enumerate(teams)}
+        n = len(teams)
+
+        games_per_team: list[list[tuple[int, float]]] = [[] for _ in range(n)]
+        for h, a, m in zip(home_ids, away_ids, home_margins):
+            hi, ai = idx_of[int(h)], idx_of[int(a)]
+            games_per_team[hi].append((ai, float(m)))
+            games_per_team[ai].append((hi, -float(m)))
+
+        ratings = np.zeros(n)
+        for _ in range(max_iter):
+            new_ratings = np.zeros(n)
+            for i, games in enumerate(games_per_team):
+                if not games:
+                    continue
+                opp_idx = [g[0] for g in games]
+                margins = [g[1] for g in games]
+                new_ratings[i] = float(np.mean(margins)) + float(np.mean(ratings[opp_idx]))
+            new_ratings -= new_ratings.mean()
+            if np.abs(new_ratings - ratings).max() < tol:
+                ratings = new_ratings
+                break
+            ratings = new_ratings
+
+        return {int(teams[i]): float(ratings[i]) for i in range(n)}
+
+    @staticmethod
+    def _season_start_year(dates: pd.Series) -> pd.Series:
+        return dates.dt.year - (dates.dt.month < 10).astype(int)
+
+    def _add_srs_pre(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["_SEASON_START"] = self._season_start_year(df["GAME_DATE"])
+        df["SRS_PRE"] = 0.0
+
+        home_pairs = df[df["IS_HOME"]][
+            ["GAME_ID", "GAME_DATE", "_SEASON_START", "TEAM_ID", "OPP_TEAM_ID", "PLUS_MINUS"]
+        ].rename(
+            columns={
+                "TEAM_ID": "HOME_ID",
+                "OPP_TEAM_ID": "AWAY_ID",
+                "PLUS_MINUS": "HOME_MARGIN",
+            }
+        )
+
+        for season, season_pairs in home_pairs.groupby("_SEASON_START"):
+            season_pairs = season_pairs.sort_values("GAME_DATE")
+            mask = df["_SEASON_START"] == season
+            season_dates = sorted(df.loc[mask, "GAME_DATE"].unique())
+            for d in season_dates:
+                prior = season_pairs[season_pairs["GAME_DATE"] < d]
+                if len(prior) < 30:
+                    continue
+                ratings = self._solve_srs(
+                    prior["HOME_ID"].to_numpy(),
+                    prior["AWAY_ID"].to_numpy(),
+                    prior["HOME_MARGIN"].to_numpy(),
+                )
+                if not ratings:
+                    continue
+                day_mask = mask & (df["GAME_DATE"] == d)
+                df.loc[day_mask, "SRS_PRE"] = df.loc[day_mask, "TEAM_ID"].map(ratings).fillna(0.0)
+
+        df = df.drop(columns=["_SEASON_START"])
         return df
 
     def build_training_frame(self, team_history_df: pd.DataFrame) -> pd.DataFrame:
@@ -173,6 +252,7 @@ class NBAModelManager:
             "REST_DAYS_PRE",
             "B2B_PRE",
             "GAMES_PLAYED_PRE",
+            "SRS_PRE",
         ]
 
         home_df = team_history_df[team_history_df["IS_HOME"]].copy()
@@ -214,6 +294,7 @@ class NBAModelManager:
         games["diff_season_defense"] = games["home_season_defense"] - games["away_season_defense"]
         games["diff_season_margin"] = games["home_season_margin"] - games["away_season_margin"]
         games["diff_rest_days"] = games["home_rest_days_pre"] - games["away_rest_days_pre"]
+        games["diff_srs"] = games["home_srs_pre"] - games["away_srs_pre"]
 
         feature_cols = self.feature_names()
         games = games.dropna(subset=feature_cols)
@@ -238,6 +319,7 @@ class NBAModelManager:
             "home_rest_days_pre",
             "home_b2b_pre",
             "home_games_played_pre",
+            "home_srs_pre",
             "away_recent_offense",
             "away_recent_defense",
             "away_recent_margin",
@@ -251,6 +333,7 @@ class NBAModelManager:
             "away_rest_days_pre",
             "away_b2b_pre",
             "away_games_played_pre",
+            "away_srs_pre",
             "diff_recent_offense",
             "diff_recent_defense",
             "diff_recent_margin",
@@ -259,6 +342,7 @@ class NBAModelManager:
             "diff_season_defense",
             "diff_season_margin",
             "diff_rest_days",
+            "diff_srs",
         ]
 
     def build_team_snapshots(self, raw_df: pd.DataFrame) -> pd.DataFrame:
@@ -268,6 +352,8 @@ class NBAModelManager:
         team_history_df = self.build_team_history(raw_df)
         if team_history_df.empty:
             return pd.DataFrame()
+
+        current_srs = self._current_srs_snapshot(team_history_df)
 
         records: list[dict[str, Any]] = []
         for team_id, team_games in team_history_df.groupby("TEAM_ID"):
@@ -290,10 +376,25 @@ class NBAModelManager:
                     "season_win_rate": float(team_games["WIN_FLAG"].mean()),
                     "games_played": int(team_games["GAME_ID"].nunique()),
                     "last_game_date": team_games["GAME_DATE"].max().date(),
+                    "srs_pre": float(current_srs.get(int(team_id), 0.0)),
                 }
             )
 
         return pd.DataFrame(records)
+
+    def _current_srs_snapshot(self, team_history_df: pd.DataFrame) -> dict[int, float]:
+        if team_history_df.empty:
+            return {}
+        latest_season = int(self._season_start_year(team_history_df["GAME_DATE"]).max())
+        season_mask = self._season_start_year(team_history_df["GAME_DATE"]) == latest_season
+        home_rows = team_history_df[season_mask & team_history_df["IS_HOME"]]
+        if len(home_rows) < 30:
+            return {}
+        return self._solve_srs(
+            home_rows["TEAM_ID"].to_numpy(),
+            home_rows["OPP_TEAM_ID"].to_numpy(),
+            home_rows["PLUS_MINUS"].to_numpy(),
+        )
 
     def build_upcoming_feature_frame(self, upcoming_df: pl.DataFrame, raw_df: pd.DataFrame | None = None) -> pd.DataFrame:
         raw_df = raw_df if raw_df is not None else self.fetch_historical_team_games()
@@ -335,6 +436,7 @@ class NBAModelManager:
                 "season_win_rate": "home_season_win_rate",
                 "games_played": "home_games_played_pre",
                 "last_game_date": "home_last_game_date",
+                "srs_pre": "home_srs_pre",
             }
         )
         away_snap = snapshots.rename(
@@ -354,6 +456,7 @@ class NBAModelManager:
                 "season_win_rate": "away_season_win_rate",
                 "games_played": "away_games_played_pre",
                 "last_game_date": "away_last_game_date",
+                "srs_pre": "away_srs_pre",
             }
         )
 
@@ -379,6 +482,7 @@ class NBAModelManager:
         upcoming["diff_season_defense"] = upcoming["home_season_defense"] - upcoming["away_season_defense"]
         upcoming["diff_season_margin"] = upcoming["home_season_margin"] - upcoming["away_season_margin"]
         upcoming["diff_rest_days"] = upcoming["home_rest_days_pre"] - upcoming["away_rest_days_pre"]
+        upcoming["diff_srs"] = upcoming["home_srs_pre"] - upcoming["away_srs_pre"]
 
         return upcoming
 
