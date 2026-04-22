@@ -183,5 +183,86 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("edge", report.columns)
 
 
+class InjuryAdjustmentTests(unittest.TestCase):
+    def test_adjustment_subtracts_damped_points_absent(self):
+        from src.data.injury_provider import (
+            IMPACT_DAMPING,
+            InjuryReport,
+            adjust_projections_for_injuries,
+        )
+
+        projections = pl.DataFrame(
+            [
+                {
+                    "home_team_id": 100,
+                    "away_team_id": 200,
+                    "home_expected_score": 115.0,
+                    "away_expected_score": 110.0,
+                }
+            ]
+        )
+        report = InjuryReport(
+            points_absent_by_team_id={100: 25.0, 200: 5.0},
+            source="test",
+        )
+        adjusted = adjust_projections_for_injuries(projections, report)
+        row = adjusted.to_dicts()[0]
+        self.assertAlmostEqual(row["home_points_absent"], 25.0)
+        self.assertAlmostEqual(row["away_points_absent"], 5.0)
+        self.assertAlmostEqual(row["home_expected_score"], 115.0 - 25.0 * IMPACT_DAMPING)
+        self.assertAlmostEqual(row["away_expected_score"], 110.0 - 5.0 * IMPACT_DAMPING)
+
+    def test_empty_report_leaves_scores_unchanged(self):
+        from src.data.injury_provider import InjuryReport, adjust_projections_for_injuries
+
+        projections = pl.DataFrame(
+            [
+                {
+                    "home_team_id": 1,
+                    "away_team_id": 2,
+                    "home_expected_score": 110.0,
+                    "away_expected_score": 108.0,
+                }
+            ]
+        )
+        adjusted = adjust_projections_for_injuries(projections, InjuryReport())
+        row = adjusted.to_dicts()[0]
+        self.assertAlmostEqual(row["home_expected_score"], 110.0)
+        self.assertAlmostEqual(row["away_expected_score"], 108.0)
+        self.assertAlmostEqual(row["home_points_absent"], 0.0)
+        self.assertAlmostEqual(row["away_points_absent"], 0.0)
+
+    def test_provider_builds_report_from_mocked_inputs(self):
+        from src.data import injury_provider as ip
+
+        provider = ip.InjuryProvider()
+        provider._ppg_cache = {
+            "star player": 28.0,
+            "role player": 8.0,
+            "long term guy": 22.0,
+        }
+        provider._recent_active_cache = {"star player", "role player"}
+        provider._fetch_espn = lambda: {  # type: ignore[assignment]
+            "Atlanta Hawks": [("Star Player", "Out"), ("Role Player", "Questionable")],
+            "Nonexistent Team": [("Star Player", "Out")],
+            "Boston Celtics": [("Unknown Name", "Out")],
+            "Chicago Bulls": [("Long Term Guy", "Out")],
+        }
+        report = provider.fetch()
+        hawks_id = next(
+            t["id"] for t in __import__("nba_api.stats.static.teams", fromlist=["x"]).get_teams()
+            if t["full_name"] == "Atlanta Hawks"
+        )
+        bulls_id = next(
+            t["id"] for t in __import__("nba_api.stats.static.teams", fromlist=["x"]).get_teams()
+            if t["full_name"] == "Chicago Bulls"
+        )
+        self.assertAlmostEqual(report.points_absent_by_team_id[hawks_id], 28.0 + 8.0 * 0.3)
+        self.assertIn("Unknown Name", report.unmatched_players)
+        self.assertIn("Long Term Guy", report.filtered_long_term)
+        self.assertNotIn(bulls_id, report.points_absent_by_team_id)
+        self.assertNotIn("Nonexistent Team", report.points_absent_by_team_id)
+
+
 if __name__ == "__main__":
     unittest.main()

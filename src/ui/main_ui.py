@@ -35,6 +35,7 @@ class SportsApp:
         self.proj_engine = AdvancedModelingEngine(
             auto_train=auto_train,
             use_trained_model=auto_train,
+            apply_injury_adjustment=use_live_data,
         )
         self.value_engine = ValueEngine()
         self.games_df = pl.DataFrame()

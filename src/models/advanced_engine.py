@@ -1,6 +1,11 @@
 import numpy as np
 import polars as pl
 
+from src.data.injury_provider import (
+    InjuryProvider,
+    InjuryReport,
+    adjust_projections_for_injuries,
+)
 from src.models.trained_nba_model import NBAModelManager
 
 
@@ -12,10 +17,15 @@ class AdvancedModelingEngine:
         monte_carlo_sims: int = 1000,
         auto_train: bool = False,
         use_trained_model: bool = False,
+        injury_provider: InjuryProvider | None = None,
+        apply_injury_adjustment: bool = False,
     ):
         self.sims = monte_carlo_sims
         self.use_trained_model = use_trained_model
         self.model_manager = NBAModelManager(auto_train=auto_train)
+        self.injury_provider = injury_provider
+        self.apply_injury_adjustment = apply_injury_adjustment
+        self._cached_injury_report: InjuryReport | None = None
 
     def simulate_player_performance(self, player_stats: dict, minutes_available: float) -> dict:
         base_rate = player_stats.get("ppg", 20.0)
@@ -77,6 +87,17 @@ class AdvancedModelingEngine:
             ]
         )
 
+    def _injury_report(self) -> InjuryReport:
+        if self._cached_injury_report is not None:
+            return self._cached_injury_report
+        provider = self.injury_provider or InjuryProvider()
+        try:
+            report = provider.fetch()
+        except Exception:
+            report = InjuryReport()
+        self._cached_injury_report = report
+        return report
+
     def generate_projections(self, upcoming_df: pl.DataFrame) -> pl.DataFrame:
         """Generates projections for upcoming games."""
         projections = None
@@ -84,6 +105,9 @@ class AdvancedModelingEngine:
             projections = self.model_manager.predict_games(upcoming_df)
         if projections is None or projections.is_empty():
             projections = self._fallback_projections(upcoming_df)
+
+        if self.apply_injury_adjustment:
+            projections = adjust_projections_for_injuries(projections, self._injury_report())
 
         projections = projections.with_columns(
             [
