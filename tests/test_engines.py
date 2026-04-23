@@ -268,6 +268,36 @@ class WalkForwardTests(unittest.TestCase):
         self.assertIn("error", results)
 
 
+class HistoricalPointsAbsentTests(unittest.TestCase):
+    def test_top_n_scorer_missing_counts_their_ppg(self):
+        from src.models.trained_nba_model import NBAModelManager
+        import pandas as pd
+
+        # Team 1: 3 players. Star averages 30 MPG / 25 PPG; others ~20 MPG.
+        # Game A: everyone plays. Game B: star plays 0 mins (injury).
+        rows = []
+        for gid in range(1, 11):  # 10 games of normal play — builds MPG average
+            rows += [
+                {"GAME_ID": f"g{gid}", "TEAM_ID": 1, "PLAYER_ID": 100, "GAME_DATE": f"2025-11-{gid:02d}", "MIN": 30, "PTS": 25},
+                {"GAME_ID": f"g{gid}", "TEAM_ID": 1, "PLAYER_ID": 101, "GAME_DATE": f"2025-11-{gid:02d}", "MIN": 20, "PTS": 12},
+                {"GAME_ID": f"g{gid}", "TEAM_ID": 1, "PLAYER_ID": 102, "GAME_DATE": f"2025-11-{gid:02d}", "MIN": 20, "PTS": 10},
+            ]
+        # Game B: star skips entirely
+        rows += [
+            {"GAME_ID": "gB", "TEAM_ID": 1, "PLAYER_ID": 101, "GAME_DATE": "2025-11-11", "MIN": 20, "PTS": 12},
+            {"GAME_ID": "gB", "TEAM_ID": 1, "PLAYER_ID": 102, "GAME_DATE": "2025-11-11", "MIN": 20, "PTS": 10},
+        ]
+        player_log = pd.DataFrame(rows)
+        player_log["GAME_DATE"] = pd.to_datetime(player_log["GAME_DATE"])
+
+        absent = NBAModelManager()._historical_points_absent(player_log, top_n=3, min_fraction=0.5)
+        by_game = dict(zip(absent["GAME_ID"], absent["POINTS_ABSENT"]))
+        # In game g1 nobody is missing → 0
+        self.assertAlmostEqual(by_game["g1"], 0.0)
+        # In gB star (avg 25 PPG across his 10 games) is absent, others played → ~25
+        self.assertAlmostEqual(by_game["gB"], 25.0, places=4)
+
+
 class InjuryAdjustmentTests(unittest.TestCase):
     def test_adjustment_subtracts_damped_points_absent(self):
         from src.data.injury_provider import (

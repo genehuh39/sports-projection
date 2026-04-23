@@ -9,7 +9,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import polars as pl
-from nba_api.stats.endpoints import leaguegamefinder
+from nba_api.stats.endpoints import leaguegamefinder, leaguegamelog
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 
@@ -635,6 +635,208 @@ class NBAModelManager:
             "total_mae_std": float(np.std(total_maes, ddof=1)) if len(total_maes) > 1 else 0.0,
             "seasons": self.seasons,
             "feature_count": len(feature_names),
+        }
+
+    def _fetch_player_game_log(self, seasons: list[str] | None = None) -> pd.DataFrame:
+        seasons = seasons or self.seasons
+        frames: list[pd.DataFrame] = []
+        for season in seasons:
+            frame = leaguegamelog.LeagueGameLog(
+                season=season,
+                player_or_team_abbreviation="P",
+                season_type_all_star="Regular Season",
+            ).get_data_frames()[0]
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
+            return pd.DataFrame()
+        combined = pd.concat(frames, ignore_index=True)
+        combined["GAME_DATE"] = pd.to_datetime(combined["GAME_DATE"])
+        combined["MIN"] = pd.to_numeric(combined["MIN"], errors="coerce").fillna(0.0)
+        combined["PTS"] = pd.to_numeric(combined["PTS"], errors="coerce").fillna(0.0)
+        return combined
+
+    def _historical_points_absent(
+        self,
+        player_log_df: pd.DataFrame,
+        top_n: int = 8,
+        min_fraction: float = 0.5,
+    ) -> pd.DataFrame:
+        """Estimate per-team, per-game "points absent" using box scores.
+
+        For each team, the top-N players by season MPG are considered the
+        rotation core. For each game, any core player whose minutes were
+        below ``min_fraction * their season MPG`` has their season PPG
+        counted as absent. Returns a DataFrame keyed by (GAME_ID, TEAM_ID)
+        with a ``POINTS_ABSENT`` column.
+
+        NB: "season MPG" here is the full-season average. This is a known
+        leakage source for calibration but not for production, since we
+        are just tuning a scalar — not training a model. The shape of the
+        absence signal is what matters.
+        """
+        if player_log_df.empty:
+            return pd.DataFrame(columns=["GAME_ID", "TEAM_ID", "POINTS_ABSENT"])
+
+        player_season = (
+            player_log_df.groupby(["PLAYER_ID", "TEAM_ID"])
+            .agg(GP=("GAME_ID", "nunique"), MIN_SUM=("MIN", "sum"), PTS_SUM=("PTS", "sum"))
+            .reset_index()
+        )
+        player_season = player_season[player_season["GP"] > 0].copy()
+        player_season["MPG"] = player_season["MIN_SUM"] / player_season["GP"]
+        player_season["PPG"] = player_season["PTS_SUM"] / player_season["GP"]
+        player_season = player_season.sort_values(
+            ["TEAM_ID", "MPG"], ascending=[True, False]
+        )
+        core = (
+            player_season.groupby("TEAM_ID", group_keys=False)
+            .head(top_n)
+            .reset_index(drop=True)
+        )
+
+        team_games = player_log_df[["GAME_ID", "TEAM_ID", "GAME_DATE"]].drop_duplicates()
+        cross = team_games.merge(core[["TEAM_ID", "PLAYER_ID", "MPG", "PPG"]], on="TEAM_ID")
+        cross = cross.merge(
+            player_log_df[["GAME_ID", "PLAYER_ID", "MIN"]],
+            on=["GAME_ID", "PLAYER_ID"],
+            how="left",
+        )
+        cross["MIN"] = cross["MIN"].fillna(0.0)
+        cross["ABSENT"] = cross["MIN"] < (min_fraction * cross["MPG"])
+        cross["POINTS_ABSENT"] = cross["PPG"] * cross["ABSENT"].astype(float)
+        return (
+            cross.groupby(["GAME_ID", "TEAM_ID"])["POINTS_ABSENT"].sum().reset_index()
+        )
+
+    def calibrate_injury_damping(
+        self,
+        damping_grid: list[float] | None = None,
+        n_folds: int = 6,
+        test_size: int = 150,
+        min_train_size: int = 400,
+        top_n: int = 8,
+        min_fraction: float = 0.5,
+    ) -> dict[str, Any]:
+        """Walk-forward CV that sweeps injury damping factors post-hoc.
+
+        For each fold, trains once on the fold's training window, makes
+        raw predictions on the test window, then evaluates MAE under each
+        damping value by subtracting damping * points_absent from the
+        raw scores. The damping that minimizes mean margin MAE across
+        folds is the empirical optimum for this harness.
+        """
+        if damping_grid is None:
+            damping_grid = [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
+
+        raw_df = self.fetch_historical_team_games(self.seasons)
+        team_history_df = self.build_team_history(raw_df)
+        training_df = self.build_training_frame(team_history_df)
+        if training_df.empty:
+            return {"folds": [], "error": "no training data"}
+
+        player_log = self._fetch_player_game_log(self.seasons)
+        absent_df = self._historical_points_absent(
+            player_log, top_n=top_n, min_fraction=min_fraction
+        )
+        absent_lookup = {
+            (str(row["GAME_ID"]), int(row["TEAM_ID"])): float(row["POINTS_ABSENT"])
+            for _, row in absent_df.iterrows()
+        }
+
+        training_df = training_df.sort_values("game_date").reset_index(drop=True)
+        training_df = training_df.copy()
+        training_df["home_points_absent"] = [
+            absent_lookup.get((str(gid), int(tid)), 0.0)
+            for gid, tid in zip(training_df["game_id"], training_df["home_team_id"])
+        ]
+        training_df["away_points_absent"] = [
+            absent_lookup.get((str(gid), int(tid)), 0.0)
+            for gid, tid in zip(training_df["game_id"], training_df["away_team_id"])
+        ]
+
+        total = len(training_df)
+        needed = min_train_size + n_folds * test_size
+        if total < needed:
+            return {"folds": [], "error": f"need {needed} rows, have {total}"}
+
+        feature_names = self.feature_names()
+        feature_defaults = {
+            name: float(training_df[name].median()) for name in feature_names
+        }
+
+        grid_results: dict[float, dict[str, list[float]]] = {
+            d: {"margin_mae": [], "total_mae": []} for d in damping_grid
+        }
+        first_test_start = total - n_folds * test_size
+        for k in range(n_folds):
+            test_start = first_test_start + k * test_size
+            test_end = test_start + test_size
+            train_df = training_df.iloc[:test_start]
+            test_df = training_df.iloc[test_start:test_end]
+            if len(train_df) < min_train_size or test_df.empty:
+                continue
+
+            X_train = train_df[feature_names].fillna(feature_defaults)
+            X_test = test_df[feature_names].fillna(feature_defaults)
+
+            margin_model = self._new_xgb_regressor()
+            total_model = self._new_xgb_regressor()
+            margin_model.fit(X_train, train_df["target_margin"])
+            total_model.fit(X_train, train_df["target_total"])
+
+            raw_margin = margin_model.predict(X_test)
+            raw_total = total_model.predict(X_test)
+            home_abs = test_df["home_points_absent"].to_numpy()
+            away_abs = test_df["away_points_absent"].to_numpy()
+            y_margin = test_df["target_margin"].to_numpy()
+            y_total = test_df["target_total"].to_numpy()
+
+            for damping in damping_grid:
+                adj_margin = raw_margin - damping * home_abs + damping * away_abs
+                adj_total = raw_total - damping * home_abs - damping * away_abs
+                grid_results[damping]["margin_mae"].append(
+                    float(mean_absolute_error(y_margin, adj_margin))
+                )
+                grid_results[damping]["total_mae"].append(
+                    float(mean_absolute_error(y_total, adj_total))
+                )
+
+        summary: list[dict[str, Any]] = []
+        for damping in damping_grid:
+            m = grid_results[damping]["margin_mae"]
+            t = grid_results[damping]["total_mae"]
+            if not m:
+                continue
+            summary.append(
+                {
+                    "damping": damping,
+                    "margin_mae_mean": float(np.mean(m)),
+                    "margin_mae_std": float(np.std(m, ddof=1)) if len(m) > 1 else 0.0,
+                    "total_mae_mean": float(np.mean(t)),
+                    "total_mae_std": float(np.std(t, ddof=1)) if len(t) > 1 else 0.0,
+                }
+            )
+
+        if not summary:
+            return {"folds": [], "error": "no folds produced"}
+
+        best_margin = min(summary, key=lambda s: s["margin_mae_mean"])
+        best_total = min(summary, key=lambda s: s["total_mae_mean"])
+        return {
+            "grid": summary,
+            "n_folds": len(grid_results[damping_grid[0]]["margin_mae"]),
+            "seasons": self.seasons,
+            "top_n_players": top_n,
+            "min_fraction": min_fraction,
+            "best_margin_damping": best_margin["damping"],
+            "best_total_damping": best_total["damping"],
+            "baseline_margin_mae": next(
+                s["margin_mae_mean"] for s in summary if s["damping"] == 0.0
+            ),
+            "baseline_total_mae": next(
+                s["total_mae_mean"] for s in summary if s["damping"] == 0.0
+            ),
         }
 
     def predict_games(self, upcoming_df: pl.DataFrame) -> pl.DataFrame | None:

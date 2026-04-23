@@ -27,8 +27,13 @@ STATUS_WEIGHT: dict[str, float] = {
     "Probable": 0.0,
 }
 
-# Replacement-level backups recover ~65% of a missing player's production.
-IMPACT_DAMPING = 0.35
+# Calibrated via sports-calibrate against walk-forward CV on 2024-25 + 2025-26.
+# Public research suggested ~0.35 but our data shows it overcorrects: the
+# RECENT_* rolling features already absorb most of the injury signal, so a
+# small damping is all that's useful. At 0.05 the improvement over zero
+# adjustment is within the fold-to-fold noise band, while 0.35 materially
+# degrades MAE.
+IMPACT_DAMPING = 0.05
 
 
 def _normalize_name(name: str) -> str:

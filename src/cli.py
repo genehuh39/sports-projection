@@ -57,6 +57,34 @@ def evaluate() -> None:
     )
 
 
+def calibrate() -> None:
+    """Sweep injury damping factors against walk-forward CV."""
+    results = NBAModelManager().calibrate_injury_damping()
+    if "error" in results and not results.get("grid"):
+        raise SystemExit(f"Calibration failed: {results['error']}")
+
+    print(f"Seasons: {', '.join(results['seasons'])}")
+    print(f"Folds: {results['n_folds']}")
+    print(f"Top-N rotation: {results['top_n_players']} (min fraction {results['min_fraction']})")
+    print()
+    print(f"{'damping':>8}  {'margin mae':>16}  {'total mae':>16}")
+    for row in results["grid"]:
+        print(
+            f"{row['damping']:>8.2f}  "
+            f"{row['margin_mae_mean']:>6.3f} ± {row['margin_mae_std']:>4.2f}   "
+            f"{row['total_mae_mean']:>6.3f} ± {row['total_mae_std']:>4.2f}"
+        )
+    print()
+    print(
+        f"Best damping for margin: {results['best_margin_damping']:.2f} "
+        f"(baseline 0.0 = {results['baseline_margin_mae']:.3f})"
+    )
+    print(
+        f"Best damping for total:  {results['best_total_damping']:.2f} "
+        f"(baseline 0.0 = {results['baseline_total_mae']:.3f})"
+    )
+
+
 def test() -> None:
     """Run the unittest suite."""
     suite = unittest.defaultTestLoader.discover("tests")
@@ -74,6 +102,8 @@ if __name__ == "__main__":
         train()
     elif command == "evaluate":
         evaluate()
+    elif command == "calibrate":
+        calibrate()
     elif command == "test":
         test()
     else:
