@@ -486,6 +486,18 @@ class NBAModelManager:
 
         return upcoming
 
+    @staticmethod
+    def _new_xgb_regressor() -> XGBRegressor:
+        return XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=250,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+        )
+
     def train_and_save(self, force: bool = False) -> ModelArtifacts | None:
         if self.artifact_path.exists() and not force:
             return self.load_artifacts()
@@ -512,24 +524,8 @@ class NBAModelManager:
         X_train = train_df[feature_names].fillna(feature_defaults)
         X_test = test_df[feature_names].fillna(feature_defaults)
 
-        margin_model = XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=250,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-        )
-        total_model = XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=250,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-        )
+        margin_model = self._new_xgb_regressor()
+        total_model = self._new_xgb_regressor()
 
         margin_model.fit(X_train, train_df["target_margin"])
         total_model.fit(X_train, train_df["target_total"])
@@ -556,6 +552,90 @@ class NBAModelManager:
         joblib.dump(payload, self.artifact_path)
         self.artifacts = ModelArtifacts(**payload)
         return self.artifacts
+
+    def walk_forward_evaluate(
+        self,
+        n_folds: int = 6,
+        test_size: int = 150,
+        min_train_size: int = 400,
+    ) -> dict[str, Any]:
+        """Run time-series walk-forward CV over the last ``n_folds * test_size`` rows.
+
+        For each fold k, trains on all games earlier than the fold's test window
+        and measures MAE on that window. Returns per-fold metrics plus aggregate
+        mean and stdev so single-split noise does not mask true signal.
+        """
+        raw_df = self.fetch_historical_team_games(self.seasons)
+        team_history_df = self.build_team_history(raw_df)
+        training_df = self.build_training_frame(team_history_df)
+        if training_df.empty:
+            return {"folds": [], "error": "no training data"}
+
+        training_df = training_df.sort_values("game_date").reset_index(drop=True)
+        total = len(training_df)
+        needed = min_train_size + n_folds * test_size
+        if total < needed:
+            return {
+                "folds": [],
+                "error": f"need {needed} rows, have {total}",
+            }
+
+        feature_names = self.feature_names()
+        feature_defaults = {
+            name: float(training_df[name].median()) for name in feature_names
+        }
+
+        fold_results: list[dict[str, Any]] = []
+        first_test_start = total - n_folds * test_size
+        for k in range(n_folds):
+            test_start = first_test_start + k * test_size
+            test_end = test_start + test_size
+            train_df = training_df.iloc[:test_start]
+            test_df = training_df.iloc[test_start:test_end]
+            if len(train_df) < min_train_size or test_df.empty:
+                continue
+
+            X_train = train_df[feature_names].fillna(feature_defaults)
+            X_test = test_df[feature_names].fillna(feature_defaults)
+
+            margin_model = self._new_xgb_regressor()
+            total_model = self._new_xgb_regressor()
+            margin_model.fit(X_train, train_df["target_margin"])
+            total_model.fit(X_train, train_df["target_total"])
+
+            margin_mae = float(
+                mean_absolute_error(test_df["target_margin"], margin_model.predict(X_test))
+            )
+            total_mae = float(
+                mean_absolute_error(test_df["target_total"], total_model.predict(X_test))
+            )
+            fold_results.append(
+                {
+                    "fold": k,
+                    "train_rows": int(len(train_df)),
+                    "test_rows": int(len(test_df)),
+                    "test_start_date": pd.Timestamp(test_df["game_date"].iloc[0]).date().isoformat(),
+                    "test_end_date": pd.Timestamp(test_df["game_date"].iloc[-1]).date().isoformat(),
+                    "margin_mae": margin_mae,
+                    "total_mae": total_mae,
+                }
+            )
+
+        if not fold_results:
+            return {"folds": [], "error": "no folds produced"}
+
+        margin_maes = [f["margin_mae"] for f in fold_results]
+        total_maes = [f["total_mae"] for f in fold_results]
+        return {
+            "folds": fold_results,
+            "n_folds": len(fold_results),
+            "margin_mae_mean": float(np.mean(margin_maes)),
+            "margin_mae_std": float(np.std(margin_maes, ddof=1)) if len(margin_maes) > 1 else 0.0,
+            "total_mae_mean": float(np.mean(total_maes)),
+            "total_mae_std": float(np.std(total_maes, ddof=1)) if len(total_maes) > 1 else 0.0,
+            "seasons": self.seasons,
+            "feature_count": len(feature_names),
+        }
 
     def predict_games(self, upcoming_df: pl.DataFrame) -> pl.DataFrame | None:
         artifacts = self.ensure_artifacts()

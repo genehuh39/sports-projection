@@ -28,6 +28,35 @@ def train() -> None:
     print(f"Total MAE: {artifacts.metrics.get('total_mae', 0):.2f}")
 
 
+def evaluate() -> None:
+    """Walk-forward cross-validation of the NBA projection model."""
+    n_folds = int(sys.argv[2]) if len(sys.argv) > 2 else 6
+    test_size = int(sys.argv[3]) if len(sys.argv) > 3 else 150
+    results = NBAModelManager().walk_forward_evaluate(n_folds=n_folds, test_size=test_size)
+
+    if "error" in results and not results.get("folds"):
+        raise SystemExit(f"Evaluation failed: {results['error']}")
+
+    print(f"Seasons: {', '.join(results['seasons'])}")
+    print(f"Features: {results['feature_count']}")
+    print(f"Folds: {results['n_folds']}")
+    print()
+    print(f"{'fold':>4}  {'dates':<25}  {'train':>6}  {'test':>5}  {'m_mae':>6}  {'t_mae':>6}")
+    for f in results["folds"]:
+        dates = f"{f['test_start_date']}..{f['test_end_date']}"
+        print(
+            f"{f['fold']:>4}  {dates:<25}  {f['train_rows']:>6}  "
+            f"{f['test_rows']:>5}  {f['margin_mae']:>6.2f}  {f['total_mae']:>6.2f}"
+        )
+    print()
+    print(
+        f"Margin MAE: {results['margin_mae_mean']:.2f} ± {results['margin_mae_std']:.2f}"
+    )
+    print(
+        f"Total  MAE: {results['total_mae_mean']:.2f} ± {results['total_mae_std']:.2f}"
+    )
+
+
 def test() -> None:
     """Run the unittest suite."""
     suite = unittest.defaultTestLoader.discover("tests")
@@ -43,6 +72,8 @@ if __name__ == "__main__":
         dashboard()
     elif command == "train":
         train()
+    elif command == "evaluate":
+        evaluate()
     elif command == "test":
         test()
     else:
