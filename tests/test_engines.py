@@ -183,6 +183,91 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("edge", report.columns)
 
 
+class WalkForwardTests(unittest.TestCase):
+    def _synthetic_raw_df(self):
+        import numpy as np
+        import pandas as pd
+        from datetime import date, timedelta
+
+        rng = np.random.default_rng(7)
+        teams = [1610612737 + i for i in range(10)]
+        rows = []
+        start = date(2024, 11, 1)
+        gid = 0
+        for day in range(140):
+            d = start + timedelta(days=day)
+            order = teams.copy()
+            rng.shuffle(order)
+            for i in range(0, len(order) - 1, 2):
+                h, a = order[i], order[i + 1]
+                margin = float(rng.normal(0, 10))
+                total_noise = float(rng.normal(0, 12))
+                gid += 1
+                home_pts = 110 + margin / 2 + total_noise / 2
+                away_pts = 110 - margin / 2 + total_noise / 2
+                rows.append(
+                    {
+                        "GAME_ID": f"00{gid:05d}",
+                        "GAME_DATE": pd.Timestamp(d),
+                        "TEAM_ID": h,
+                        "TEAM_ABBREVIATION": f"T{h % 100}",
+                        "TEAM_NAME": f"Team {h}",
+                        "MATCHUP": f"T{h} vs. T{a}",
+                        "WL": "W" if margin > 0 else "L",
+                        "PTS": home_pts,
+                        "FGA": 85,
+                        "FTA": 20,
+                        "OREB": 10,
+                        "TOV": 14,
+                        "PLUS_MINUS": margin,
+                    }
+                )
+                rows.append(
+                    {
+                        "GAME_ID": f"00{gid:05d}",
+                        "GAME_DATE": pd.Timestamp(d),
+                        "TEAM_ID": a,
+                        "TEAM_ABBREVIATION": f"T{a % 100}",
+                        "TEAM_NAME": f"Team {a}",
+                        "MATCHUP": f"T{a} @ T{h}",
+                        "WL": "L" if margin > 0 else "W",
+                        "PTS": away_pts,
+                        "FGA": 85,
+                        "FTA": 20,
+                        "OREB": 10,
+                        "TOV": 14,
+                        "PLUS_MINUS": -margin,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def test_walk_forward_returns_sensible_aggregates(self):
+        from src.models.trained_nba_model import NBAModelManager
+
+        manager = NBAModelManager()
+        raw = self._synthetic_raw_df()
+        manager.fetch_historical_team_games = lambda seasons=None: raw  # type: ignore[assignment]
+
+        results = manager.walk_forward_evaluate(n_folds=3, test_size=40, min_train_size=80)
+        self.assertEqual(len(results["folds"]), 3)
+        self.assertGreater(results["margin_mae_mean"], 0)
+        self.assertGreater(results["total_mae_mean"], 0)
+        train_rows = [f["train_rows"] for f in results["folds"]]
+        self.assertEqual(train_rows, sorted(train_rows))
+        for f in results["folds"]:
+            self.assertLessEqual(f["test_start_date"], f["test_end_date"])
+
+    def test_walk_forward_reports_insufficient_data(self):
+        from src.models.trained_nba_model import NBAModelManager
+        import pandas as pd
+
+        manager = NBAModelManager()
+        manager.fetch_historical_team_games = lambda seasons=None: pd.DataFrame()  # type: ignore[assignment]
+        results = manager.walk_forward_evaluate(n_folds=3, test_size=40)
+        self.assertEqual(results["folds"], [])
+        self.assertIn("error", results)
+
+
 class InjuryAdjustmentTests(unittest.TestCase):
     def test_adjustment_subtracts_damped_points_absent(self):
         from src.data.injury_provider import (
