@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 from nba_api.stats.endpoints import leaguegamefinder, leaguegamelog
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
 from xgboost import XGBRegressor
 
 
@@ -837,6 +837,169 @@ class NBAModelManager:
             "baseline_total_mae": next(
                 s["total_mae_mean"] for s in summary if s["damping"] == 0.0
             ),
+        }
+
+    @staticmethod
+    def _margin_to_home_win_prob(margin: np.ndarray, scale: float = 8.0) -> np.ndarray:
+        """Match the engine's logistic mapping in advanced_engine.py."""
+        return 1.0 / (1.0 + np.exp(-margin / scale))
+
+    def backtest_evaluate(
+        self,
+        n_folds: int = 6,
+        test_size: int = 150,
+        min_train_size: int = 400,
+        vig: float = 0.0476,
+        edge_thresholds: list[float] | None = None,
+        n_calibration_buckets: int = 10,
+    ) -> dict[str, Any]:
+        """Walk-forward backtest against a synthetic uniform -110 market.
+
+        Computes calibration (Brier, log loss, accuracy, decile-bucket
+        calibration) plus ROI for an "edge > threshold" betting strategy
+        assuming a flat ``vig`` line on every game. The synthetic market
+        means ROI is a benchmark, not a real-world PnL number — once
+        historical odds are wired in, swap the synthetic prices for
+        actual ones at the same call site.
+
+        Default vig of 0.0476 corresponds to standard -110 / -110 lines
+        (overround = 2 * 110/210 - 1). Breakeven prob = (1 + vig) / 2 =
+        0.5238. Win payout per $1 = (1 - vig) / (1 + vig) ≈ 0.9091.
+        """
+        if edge_thresholds is None:
+            edge_thresholds = [0.0, 0.02, 0.05, 0.10]
+
+        raw_df = self.fetch_historical_team_games(self.seasons)
+        team_history_df = self.build_team_history(raw_df)
+        training_df = self.build_training_frame(team_history_df)
+        if training_df.empty:
+            return {"folds": [], "error": "no training data"}
+
+        training_df = training_df.sort_values("game_date").reset_index(drop=True)
+        total = len(training_df)
+        needed = min_train_size + n_folds * test_size
+        if total < needed:
+            return {"folds": [], "error": f"need {needed} rows, have {total}"}
+
+        feature_names = self.feature_names()
+        feature_defaults = {
+            name: float(training_df[name].median()) for name in feature_names
+        }
+
+        breakeven = (1.0 + vig) / 2.0
+        win_payout = (1.0 - vig) / (1.0 + vig)
+
+        per_fold: list[dict[str, Any]] = []
+        all_probs: list[float] = []
+        all_outcomes: list[int] = []
+        threshold_pnl: dict[float, list[float]] = {t: [] for t in edge_thresholds}
+
+        first_test_start = total - n_folds * test_size
+        for k in range(n_folds):
+            test_start = first_test_start + k * test_size
+            test_end = test_start + test_size
+            train_df = training_df.iloc[:test_start]
+            test_df = training_df.iloc[test_start:test_end]
+            if len(train_df) < min_train_size or test_df.empty:
+                continue
+
+            X_train = train_df[feature_names].fillna(feature_defaults)
+            X_test = test_df[feature_names].fillna(feature_defaults)
+
+            margin_model = self._new_xgb_regressor()
+            margin_model.fit(X_train, train_df["target_margin"])
+            predicted_margin = margin_model.predict(X_test)
+            predicted_home_prob = self._margin_to_home_win_prob(predicted_margin)
+            predicted_home_prob = np.clip(predicted_home_prob, 1e-6, 1 - 1e-6)
+            actual_home_win = (test_df["target_margin"].to_numpy() > 0).astype(int)
+
+            for prob, outcome in zip(predicted_home_prob, actual_home_win):
+                all_probs.append(float(prob))
+                all_outcomes.append(int(outcome))
+
+            picks = (predicted_home_prob >= 0.5).astype(int)
+            accuracy = float((picks == actual_home_win).mean())
+            brier = float(brier_score_loss(actual_home_win, predicted_home_prob))
+            ll = float(log_loss(actual_home_win, predicted_home_prob, labels=[0, 1]))
+
+            fold_record: dict[str, Any] = {
+                "fold": k,
+                "n_games": int(len(test_df)),
+                "accuracy": accuracy,
+                "brier": brier,
+                "log_loss": ll,
+            }
+            for threshold in edge_thresholds:
+                bet_home = predicted_home_prob >= breakeven + threshold
+                bet_away = (1.0 - predicted_home_prob) >= breakeven + threshold
+                pnls: list[float] = []
+                for ph, bh, ba, win in zip(
+                    predicted_home_prob, bet_home, bet_away, actual_home_win
+                ):
+                    if bh:
+                        pnls.append(win_payout if win == 1 else -1.0)
+                    elif ba:
+                        pnls.append(win_payout if win == 0 else -1.0)
+                threshold_pnl[threshold].extend(pnls)
+                if pnls:
+                    fold_record[f"roi@{threshold:.2f}"] = float(np.mean(pnls))
+                    fold_record[f"n_bets@{threshold:.2f}"] = int(len(pnls))
+                else:
+                    fold_record[f"roi@{threshold:.2f}"] = 0.0
+                    fold_record[f"n_bets@{threshold:.2f}"] = 0
+            per_fold.append(fold_record)
+
+        if not per_fold:
+            return {"folds": [], "error": "no folds produced"}
+
+        probs_arr = np.asarray(all_probs)
+        outcomes_arr = np.asarray(all_outcomes)
+        bucket_edges = np.linspace(0.0, 1.0, n_calibration_buckets + 1)
+        calibration: list[dict[str, float]] = []
+        for i in range(n_calibration_buckets):
+            lo, hi = bucket_edges[i], bucket_edges[i + 1]
+            mask = (probs_arr >= lo) & (probs_arr < hi if i < n_calibration_buckets - 1 else probs_arr <= hi)
+            if not mask.any():
+                continue
+            calibration.append(
+                {
+                    "bucket_lo": float(lo),
+                    "bucket_hi": float(hi),
+                    "n": int(mask.sum()),
+                    "mean_predicted": float(probs_arr[mask].mean()),
+                    "actual_rate": float(outcomes_arr[mask].mean()),
+                }
+            )
+
+        threshold_summary: list[dict[str, Any]] = []
+        for threshold in edge_thresholds:
+            pnls = threshold_pnl[threshold]
+            threshold_summary.append(
+                {
+                    "edge_threshold": threshold,
+                    "n_bets": int(len(pnls)),
+                    "roi_mean": float(np.mean(pnls)) if pnls else 0.0,
+                    "roi_std": float(np.std(pnls, ddof=1)) if len(pnls) > 1 else 0.0,
+                    "win_rate": float(
+                        sum(1 for p in pnls if p > 0) / len(pnls)
+                    ) if pnls else 0.0,
+                }
+            )
+
+        return {
+            "folds": per_fold,
+            "n_folds": len(per_fold),
+            "seasons": self.seasons,
+            "vig": vig,
+            "breakeven_prob": breakeven,
+            "win_payout": win_payout,
+            "accuracy_mean": float(np.mean([f["accuracy"] for f in per_fold])),
+            "accuracy_std": float(np.std([f["accuracy"] for f in per_fold], ddof=1))
+            if len(per_fold) > 1 else 0.0,
+            "brier_mean": float(np.mean([f["brier"] for f in per_fold])),
+            "log_loss_mean": float(np.mean([f["log_loss"] for f in per_fold])),
+            "calibration": calibration,
+            "thresholds": threshold_summary,
         }
 
     def predict_games(self, upcoming_df: pl.DataFrame) -> pl.DataFrame | None:

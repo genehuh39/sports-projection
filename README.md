@@ -39,6 +39,7 @@ uv sync
 | `uv run sports-train`      | Trains the XGBoost model and saves to `artifacts/nba_projection_model.joblib` |
 | `uv run sports-eval`       | Walk-forward CV over 6 folds, reports per-fold and aggregate MAE |
 | `uv run sports-calibrate`  | Sweeps injury damping factors against historical box scores |
+| `uv run sports-backtest`   | Calibration metrics (Brier, log loss, accuracy) + synthetic-market ROI by edge |
 | `uv run sports-test`       | Test suite |
 
 `sports-eval` and `sports-calibrate` accept positional args, e.g. `uv run sports-eval 8 100` for 8 folds × 100 games each.
