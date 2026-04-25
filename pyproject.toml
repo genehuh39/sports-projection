@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sports-projection"
-version = "0.3.0"
+version = "0.4.0"
 description = "Prototype NBA game projection and betting value dashboard"
 readme = "README.md"
 license = { text = "MIT" }
