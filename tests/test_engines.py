@@ -268,6 +268,78 @@ class WalkForwardTests(unittest.TestCase):
         self.assertIn("error", results)
 
 
+class BacktestTests(unittest.TestCase):
+    def _synthetic_raw_df(self):
+        import numpy as np
+        import pandas as pd
+        from datetime import date, timedelta
+
+        rng = np.random.default_rng(13)
+        teams = [1610612737 + i for i in range(10)]
+        rows = []
+        start = date(2024, 11, 1)
+        gid = 0
+        for day in range(140):
+            d = start + timedelta(days=day)
+            order = teams.copy()
+            rng.shuffle(order)
+            for i in range(0, len(order) - 1, 2):
+                h, a = order[i], order[i + 1]
+                margin = float(rng.normal(2.0, 10))  # mild home advantage
+                noise = float(rng.normal(0, 12))
+                gid += 1
+                rows.append(
+                    {
+                        "GAME_ID": f"00{gid:05d}", "GAME_DATE": pd.Timestamp(d), "TEAM_ID": h,
+                        "TEAM_ABBREVIATION": f"T{h % 100}", "TEAM_NAME": f"Team {h}",
+                        "MATCHUP": f"T{h} vs. T{a}", "WL": "W" if margin > 0 else "L",
+                        "PTS": 110 + margin / 2 + noise / 2,
+                        "FGA": 85, "FTA": 20, "OREB": 10, "TOV": 14, "PLUS_MINUS": margin,
+                    }
+                )
+                rows.append(
+                    {
+                        "GAME_ID": f"00{gid:05d}", "GAME_DATE": pd.Timestamp(d), "TEAM_ID": a,
+                        "TEAM_ABBREVIATION": f"T{a % 100}", "TEAM_NAME": f"Team {a}",
+                        "MATCHUP": f"T{a} @ T{h}", "WL": "L" if margin > 0 else "W",
+                        "PTS": 110 - margin / 2 + noise / 2,
+                        "FGA": 85, "FTA": 20, "OREB": 10, "TOV": 14, "PLUS_MINUS": -margin,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def test_backtest_returns_calibration_and_threshold_summaries(self):
+        from src.models.trained_nba_model import NBAModelManager
+
+        manager = NBAModelManager()
+        manager.fetch_historical_team_games = lambda seasons=None: self._synthetic_raw_df()  # type: ignore[assignment]
+
+        results = manager.backtest_evaluate(n_folds=3, test_size=40, min_train_size=80)
+        self.assertEqual(len(results["folds"]), 3)
+        self.assertGreaterEqual(results["accuracy_mean"], 0.0)
+        self.assertLessEqual(results["accuracy_mean"], 1.0)
+        self.assertGreater(results["brier_mean"], 0.0)
+        self.assertLess(results["brier_mean"], 1.0)
+        self.assertGreaterEqual(len(results["calibration"]), 1)
+        for row in results["calibration"]:
+            self.assertGreaterEqual(row["mean_predicted"], 0.0)
+            self.assertLessEqual(row["mean_predicted"], 1.0)
+        thresholds = {row["edge_threshold"] for row in results["thresholds"]}
+        self.assertIn(0.0, thresholds)
+        self.assertIn(0.05, thresholds)
+
+    def test_backtest_breakeven_constants(self):
+        from src.models.trained_nba_model import NBAModelManager
+
+        manager = NBAModelManager()
+        manager.fetch_historical_team_games = lambda seasons=None: self._synthetic_raw_df()  # type: ignore[assignment]
+        results = manager.backtest_evaluate(n_folds=3, test_size=40, min_train_size=80)
+        # Default vig 0.0476 ≈ -110/-110; breakeven prob ~0.5238
+        self.assertAlmostEqual(results["breakeven_prob"], (1 + 0.0476) / 2.0)
+        self.assertAlmostEqual(results["win_payout"], (1 - 0.0476) / (1 + 0.0476))
+        self.assertAlmostEqual(results["breakeven_prob"], 0.5238, places=3)
+
+
 class HistoricalPointsAbsentTests(unittest.TestCase):
     def test_top_n_scorer_missing_counts_their_ppg(self):
         from src.models.trained_nba_model import NBAModelManager

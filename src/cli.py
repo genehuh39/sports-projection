@@ -85,6 +85,48 @@ def calibrate() -> None:
     )
 
 
+def backtest() -> None:
+    """Walk-forward backtest against a synthetic uniform -110 market."""
+    results = NBAModelManager().backtest_evaluate()
+    if "error" in results and not results.get("folds"):
+        raise SystemExit(f"Backtest failed: {results['error']}")
+
+    print(f"Seasons: {', '.join(results['seasons'])}")
+    print(
+        f"Synthetic market: vig={results['vig']:.4f}  "
+        f"breakeven_prob={results['breakeven_prob']:.4f}  "
+        f"win_payout={results['win_payout']:+.4f}"
+    )
+    print(f"Folds: {results['n_folds']}")
+    print()
+    print(f"Accuracy: {results['accuracy_mean']:.3f} ± {results['accuracy_std']:.3f}")
+    print(f"Brier:    {results['brier_mean']:.4f}")
+    print(f"Log loss: {results['log_loss_mean']:.4f}")
+    print()
+    print("Calibration table (predicted probability -> actual home-win rate)")
+    print(f"  {'bucket':<14}  {'n':>5}  {'pred':>7}  {'actual':>7}")
+    for row in results["calibration"]:
+        bucket = f"{row['bucket_lo']:.1f}-{row['bucket_hi']:.1f}"
+        print(
+            f"  {bucket:<14}  {row['n']:>5}  "
+            f"{row['mean_predicted']:>7.3f}  {row['actual_rate']:>7.3f}"
+        )
+    print()
+    print("Synthetic-market ROI by edge threshold")
+    print(f"  {'edge>':>6}  {'n_bets':>7}  {'roi':>9}  {'win_rate':>9}")
+    for row in results["thresholds"]:
+        roi_pct = row["roi_mean"] * 100.0
+        print(
+            f"  {row['edge_threshold']:>6.2f}  {row['n_bets']:>7}  "
+            f"{roi_pct:>+8.2f}%  {row['win_rate']:>9.3f}"
+        )
+    print()
+    print(
+        "Note: ROI is against a uniform -110 market — a benchmark, not a "
+        "real-world PnL number. Real bookmaker prices will differ."
+    )
+
+
 def test() -> None:
     """Run the unittest suite."""
     suite = unittest.defaultTestLoader.discover("tests")
@@ -104,6 +146,8 @@ if __name__ == "__main__":
         evaluate()
     elif command == "calibrate":
         calibrate()
+    elif command == "backtest":
+        backtest()
     elif command == "test":
         test()
     else:
