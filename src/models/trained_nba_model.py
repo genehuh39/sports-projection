@@ -868,6 +868,8 @@ class NBAModelManager:
         """
         if edge_thresholds is None:
             edge_thresholds = [0.0, 0.02, 0.05, 0.10]
+        # Dedupe while preserving order so duplicate thresholds don't double-count
+        edge_thresholds = list(dict.fromkeys(edge_thresholds))
 
         raw_df = self.fetch_historical_team_games(self.seasons)
         team_history_df = self.build_team_history(raw_df)
@@ -922,32 +924,34 @@ class NBAModelManager:
             brier = float(brier_score_loss(actual_home_win, predicted_home_prob))
             ll = float(log_loss(actual_home_win, predicted_home_prob, labels=[0, 1]))
 
-            fold_record: dict[str, Any] = {
-                "fold": k,
-                "n_games": int(len(test_df)),
-                "accuracy": accuracy,
-                "brier": brier,
-                "log_loss": ll,
-            }
+            fold_thresholds: list[dict[str, Any]] = []
             for threshold in edge_thresholds:
                 bet_home = predicted_home_prob >= breakeven + threshold
                 bet_away = (1.0 - predicted_home_prob) >= breakeven + threshold
                 pnls: list[float] = []
-                for ph, bh, ba, win in zip(
-                    predicted_home_prob, bet_home, bet_away, actual_home_win
-                ):
+                for bh, ba, win in zip(bet_home, bet_away, actual_home_win):
                     if bh:
                         pnls.append(win_payout if win == 1 else -1.0)
                     elif ba:
                         pnls.append(win_payout if win == 0 else -1.0)
                 threshold_pnl[threshold].extend(pnls)
-                if pnls:
-                    fold_record[f"roi@{threshold:.2f}"] = float(np.mean(pnls))
-                    fold_record[f"n_bets@{threshold:.2f}"] = int(len(pnls))
-                else:
-                    fold_record[f"roi@{threshold:.2f}"] = 0.0
-                    fold_record[f"n_bets@{threshold:.2f}"] = 0
-            per_fold.append(fold_record)
+                fold_thresholds.append(
+                    {
+                        "edge_threshold": threshold,
+                        "n_bets": int(len(pnls)),
+                        "roi": float(np.mean(pnls)) if pnls else 0.0,
+                    }
+                )
+            per_fold.append(
+                {
+                    "fold": k,
+                    "n_games": int(len(test_df)),
+                    "accuracy": accuracy,
+                    "brier": brier,
+                    "log_loss": ll,
+                    "thresholds": fold_thresholds,
+                }
+            )
 
         if not per_fold:
             return {"folds": [], "error": "no folds produced"}
