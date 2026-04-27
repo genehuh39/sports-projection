@@ -36,6 +36,47 @@ class PlattCalibrator:
         return self._lr.predict_proba(np.asarray(raw_prob).reshape(-1, 1))[:, 1]
 
 
+class TemperatureCalibrator:
+    """Single-parameter logit rescaling on raw probabilities.
+
+    Multiplies the input logit by a learned scale before re-applying
+    sigmoid: ``p_calibrated = sigmoid(scale * logit(p_raw))``. Scale
+    < 1 softens overconfidence at the tails; scale > 1 sharpens. With
+    only one fitted parameter this is much harder to overfit on small
+    calibration sets than Platt's two or isotonic's many — appropriate
+    when the bias has a smooth, monotonic shape.
+    """
+
+    def __init__(self) -> None:
+        self.scale: float = 1.0
+
+    def fit(self, raw_prob: np.ndarray, y: np.ndarray) -> "TemperatureCalibrator":
+        from scipy.optimize import minimize_scalar
+
+        prob = np.clip(np.asarray(raw_prob, dtype=float), 1e-6, 1 - 1e-6)
+        logits = np.log(prob / (1.0 - prob))
+        target = np.asarray(y, dtype=float)
+
+        def neg_log_likelihood(scale: float) -> float:
+            adjusted = np.clip(
+                1.0 / (1.0 + np.exp(-logits * scale)), 1e-6, 1 - 1e-6
+            )
+            return -float(
+                np.mean(target * np.log(adjusted) + (1 - target) * np.log(1 - adjusted))
+            )
+
+        result = minimize_scalar(
+            neg_log_likelihood, bounds=(0.05, 5.0), method="bounded"
+        )
+        self.scale = float(result.x)
+        return self
+
+    def predict(self, raw_prob: np.ndarray) -> np.ndarray:
+        prob = np.clip(np.asarray(raw_prob, dtype=float), 1e-6, 1 - 1e-6)
+        logits = np.log(prob / (1.0 - prob))
+        return 1.0 / (1.0 + np.exp(-logits * self.scale))
+
+
 @dataclass
 class ModelArtifacts:
     feature_names: list[str]
@@ -45,7 +86,7 @@ class ModelArtifacts:
     trained_at: str
     margin_model: XGBRegressor
     total_model: XGBRegressor
-    win_prob_calibrator: PlattCalibrator | None = None
+    win_prob_calibrator: TemperatureCalibrator | None = None
 
 
 class NBAModelManager:
@@ -586,8 +627,8 @@ class NBAModelManager:
     @staticmethod
     def _fit_win_prob_calibrator(
         raw_prob: np.ndarray, actual_home_win: np.ndarray
-    ) -> PlattCalibrator:
-        return PlattCalibrator().fit(raw_prob, actual_home_win)
+    ) -> TemperatureCalibrator:
+        return TemperatureCalibrator().fit(raw_prob, actual_home_win)
 
     def walk_forward_evaluate(
         self,
@@ -946,7 +987,7 @@ class NBAModelManager:
             X_test = test_df[feature_names].fillna(feature_defaults)
 
             margin_model = self._new_xgb_regressor()
-            calibrator: PlattCalibrator | None = None
+            calibrator: TemperatureCalibrator | None = None
             if (
                 apply_calibration
                 and len(train_df) >= min_train_size + calibration_holdout
