@@ -453,6 +453,99 @@ class KalshiProviderTests(unittest.TestCase):
         self.assertIsNone(rows[1]["edge_away"])
 
 
+class PolymarketProviderTests(unittest.TestCase):
+    def test_slug_parser(self):
+        from src.data.polymarket_provider import _parse_nba_slug
+        from datetime import date
+
+        self.assertEqual(
+            _parse_nba_slug("nba-det-orl-2026-04-27"),
+            (date(2026, 4, 27), "DET", "ORL"),
+        )
+        self.assertEqual(
+            _parse_nba_slug("nba-min-den-2026-04-27"),
+            (date(2026, 4, 27), "MIN", "DEN"),
+        )
+        # Spread / totals slugs are skipped
+        self.assertIsNone(_parse_nba_slug("spread-pistons-3-5-2026-04-27"))
+        self.assertIsNone(_parse_nba_slug("nba-det-orl-2026-04-27-spread-3-5"))
+
+    def test_outcome_prices_accepts_string_or_list(self):
+        from src.data.polymarket_provider import _parse_outcome_prices
+
+        self.assertEqual(_parse_outcome_prices(["0.6", "0.4"]), [0.6, 0.4])
+        self.assertEqual(_parse_outcome_prices('["0.6", "0.4"]'), [0.6, 0.4])
+        self.assertIsNone(_parse_outcome_prices("not-json"))
+        self.assertIsNone(_parse_outcome_prices(None))
+
+    def test_provider_assembles_games_from_mocked_payload(self):
+        from src.data import polymarket_provider as pm
+        from datetime import date
+
+        provider = pm.PolymarketProvider()
+        provider._list_active_markets = lambda: [  # type: ignore[assignment]
+            {
+                "conditionId": "0xabc",
+                "slug": "nba-det-orl-2026-04-27",
+                "question": "Pistons vs. Magic",
+                "outcomes": '["Pistons", "Magic"]',
+                "outcomePrices": '["0.595", "0.405"]',
+                "volume24hr": 1000.0,
+            },
+            {
+                "slug": "spread-pistons-3-5-2026-04-27",  # filtered out
+                "outcomePrices": '["0.5", "0.5"]',
+            },
+        ]
+        snap = provider.fetch()
+        self.assertEqual(len(snap.games), 1)
+        g = snap.games[0]
+        self.assertEqual(g.home_team_abbr, "ORL")
+        self.assertEqual(g.away_team_abbr, "DET")
+        self.assertEqual(g.game_date, date(2026, 4, 27))
+        self.assertAlmostEqual(g.home_yes_ask, 0.405)
+        self.assertAlmostEqual(g.away_yes_ask, 0.595)
+
+    def test_compute_polymarket_edges(self):
+        from src.data.polymarket_provider import (
+            PolymarketGameMarket,
+            PolymarketSnapshot,
+            compute_polymarket_edges,
+        )
+        from datetime import date
+
+        snapshot = PolymarketSnapshot(
+            games=[
+                PolymarketGameMarket(
+                    market_id="m1",
+                    slug="nba-det-orl-2026-04-27",
+                    game_date=date(2026, 4, 27),
+                    home_team_abbr="ORL",
+                    away_team_abbr="DET",
+                    home_yes_bid=0.405,
+                    home_yes_ask=0.405,
+                    away_yes_bid=0.595,
+                    away_yes_ask=0.595,
+                )
+            ],
+            source="polymarket",
+        )
+        games = pl.DataFrame(
+            [
+                {
+                    "home_team_code": "ORL",
+                    "away_team_code": "DET",
+                    "game_date": "2026-04-27",
+                    "home_win_prob": 0.323,
+                }
+            ]
+        )
+        out = compute_polymarket_edges(snapshot, games)
+        row = out.to_dicts()[0]
+        self.assertAlmostEqual(row["edge_home_pm"], 0.323 - 0.405)
+        self.assertAlmostEqual(row["edge_away_pm"], (1 - 0.323) - 0.595)
+
+
 class HistoricalPointsAbsentTests(unittest.TestCase):
     def test_top_n_scorer_missing_counts_their_ppg(self):
         from src.models.trained_nba_model import NBAModelManager

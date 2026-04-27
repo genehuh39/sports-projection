@@ -262,6 +262,96 @@ def kalshi() -> None:
     )
 
 
+def polymarket() -> None:
+    """Compare model probabilities against live Polymarket NBA prices."""
+    import polars as pl
+    from nba_api.stats.static import teams as nba_static_teams
+
+    from src.data.polymarket_provider import (
+        PolymarketProvider,
+        compute_polymarket_edges,
+    )
+    from src.models.advanced_engine import AdvancedModelingEngine
+
+    snapshot = PolymarketProvider().fetch()
+    if not snapshot.games:
+        print(
+            f"Polymarket returned no NBA game markets (source={snapshot.source})."
+        )
+        return
+
+    abbr_to_team_id = {
+        t["abbreviation"]: int(t["id"]) for t in nba_static_teams.get_teams()
+    }
+    upcoming_rows = []
+    for g in snapshot.games:
+        home_id = abbr_to_team_id.get(g.home_team_abbr)
+        away_id = abbr_to_team_id.get(g.away_team_abbr)
+        if home_id is None or away_id is None:
+            continue
+        upcoming_rows.append(
+            {
+                "game_id": g.slug,
+                "game_date": g.game_date.isoformat(),
+                "home_team_id": home_id,
+                "away_team_id": away_id,
+                "home_team_code": g.home_team_abbr,
+                "away_team_code": g.away_team_abbr,
+                "market_odds": -110,
+            }
+        )
+    if not upcoming_rows:
+        print("Polymarket markets returned but no NBA team-abbreviation matches.")
+        return
+    upcoming = pl.DataFrame(upcoming_rows)
+
+    engine = AdvancedModelingEngine(
+        auto_train=True, use_trained_model=True, apply_injury_adjustment=False
+    )
+    projections = engine.generate_projections(upcoming)
+    annotated = compute_polymarket_edges(snapshot, projections)
+
+    rows = annotated.to_dicts()
+    print(
+        f"{'matchup':<14}  {'date':<10}  {'p_home':>6}  {'pm_h':>6}  "
+        f"{'edge_h':>7}  {'pm_a':>6}  {'edge_a':>7}  {'slug'}"
+    )
+    matched = 0
+    for r in rows:
+        matchup = (
+            f"{(r.get('away_team_code') or '')[:3]:<3} @ "
+            f"{(r.get('home_team_code') or '')[:3]:<3}"
+        )
+        gd = str(r.get("game_date", ""))[:10]
+        ph = r.get("home_win_prob")
+        ph_pm = r.get("polymarket_home_price")
+        pa_pm = r.get("polymarket_away_price")
+        eh = r.get("edge_home_pm")
+        ea = r.get("edge_away_pm")
+        slug = r.get("polymarket_slug") or ""
+        if slug:
+            matched += 1
+        print(
+            f"{matchup:<14}  {gd:<10}  "
+            f"{(f'{ph:.3f}' if ph is not None else '   -  '):>6}  "
+            f"{(f'{ph_pm:.3f}' if ph_pm is not None else '  -  '):>6}  "
+            f"{(f'{eh:+.3f}' if eh is not None else '   -  '):>7}  "
+            f"{(f'{pa_pm:.3f}' if pa_pm is not None else '  -  '):>6}  "
+            f"{(f'{ea:+.3f}' if ea is not None else '   -  '):>7}  "
+            f"{slug}"
+        )
+    print()
+    print(f"Matched {matched} / {len(rows)} games to Polymarket markets.")
+    print(
+        "edge_h = model_home_prob - polymarket_home_price  "
+        "(positive => model thinks home more likely than market)"
+    )
+    print(
+        "Note: prices are last-trade from Polymarket gamma API, not bid/ask. "
+        "Real fills happen at CLOB book."
+    )
+
+
 def test() -> None:
     """Run the unittest suite."""
     suite = unittest.defaultTestLoader.discover("tests")
@@ -285,6 +375,8 @@ if __name__ == "__main__":
         backtest()
     elif command == "kalshi":
         kalshi()
+    elif command == "polymarket":
+        polymarket()
     elif command == "test":
         test()
     else:
