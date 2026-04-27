@@ -546,6 +546,77 @@ class PolymarketProviderTests(unittest.TestCase):
         self.assertAlmostEqual(row["edge_away_pm"], (1 - 0.323) - 0.595)
 
 
+class PaperTradeJournalTests(unittest.TestCase):
+    def _journal(self):
+        import tempfile
+        from src.data.journal import PaperTradeJournal
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        return PaperTradeJournal(path=tmp.name)
+
+    def test_yes_pnl_math(self):
+        from src.data.journal import yes_pnl
+
+        # Won YES at 0.40 -> profit ratio 0.6/0.4 = 1.5
+        self.assertAlmostEqual(yes_pnl(0.40, True), 1.5)
+        # Lost YES at any price -> -1.0
+        self.assertAlmostEqual(yes_pnl(0.40, False), -1.0)
+        # Won at 0.50 -> 1.0 ROI
+        self.assertAlmostEqual(yes_pnl(0.50, True), 1.0)
+
+    def test_append_dedup_by_venue_game_side(self):
+        from src.data.journal import PaperTrade
+
+        journal = self._journal()
+        trade = PaperTrade(
+            venue="polymarket",
+            game_id="nba-det-orl-2026-04-27",
+            game_date="2026-04-27",
+            home_team_abbr="ORL",
+            away_team_abbr="DET",
+            side="home",
+            model_prob=0.50,
+            market_price=0.40,
+            edge=0.10,
+        )
+        self.assertTrue(journal.append(trade))
+        # Same trade -> dedup
+        self.assertFalse(journal.append(trade))
+        # Different side same game -> allowed
+        trade2 = PaperTrade(**{**trade.__dict__, "side": "away"})
+        self.assertTrue(journal.append(trade2))
+
+    def test_settle_writes_pnl_and_status(self):
+        from src.data.journal import PaperTrade, yes_pnl
+
+        journal = self._journal()
+        journal.append(
+            PaperTrade(
+                venue="polymarket",
+                game_id="g1",
+                game_date="2026-04-20",
+                home_team_abbr="ORL",
+                away_team_abbr="DET",
+                side="home",
+                model_prob=0.55,
+                market_price=0.45,
+                edge=0.10,
+            )
+        )
+        opens = journal.list_open_past_games("2026-04-25")
+        self.assertEqual(len(opens), 1)
+        t = opens[0]
+        journal.mark_settled(
+            t.id, home_won=True, side_won=True, realized_pnl=yes_pnl(0.45, True)
+        )
+        settled = journal.list_settled()
+        self.assertEqual(len(settled), 1)
+        self.assertEqual(settled[0].status, "settled")
+        self.assertAlmostEqual(settled[0].realized_pnl, (1 - 0.45) / 0.45)
+        self.assertEqual(settled[0].side_won, 1)
+
+
 class HistoricalPointsAbsentTests(unittest.TestCase):
     def test_top_n_scorer_missing_counts_their_ppg(self):
         from src.models.trained_nba_model import NBAModelManager

@@ -352,6 +352,196 @@ def polymarket() -> None:
     )
 
 
+def paper_trade() -> None:
+    """Log paper trades against current Polymarket prices.
+
+    For each market with edge > threshold (default 0.05) on either side,
+    inserts a journal entry. Idempotent per (venue, game_id, side).
+    """
+    import polars as pl
+    from datetime import date as date_cls
+    from nba_api.stats.static import teams as nba_static_teams
+
+    from src.data.journal import PaperTrade, PaperTradeJournal
+    from src.data.polymarket_provider import (
+        PolymarketProvider,
+        compute_polymarket_edges,
+    )
+    from src.models.advanced_engine import AdvancedModelingEngine
+
+    threshold = float(sys.argv[2]) if len(sys.argv) > 2 else 0.05
+
+    snapshot = PolymarketProvider().fetch()
+    if not snapshot.games:
+        print("Polymarket returned no NBA markets.")
+        return
+
+    abbr_to_team_id = {
+        t["abbreviation"]: int(t["id"]) for t in nba_static_teams.get_teams()
+    }
+    upcoming_rows = []
+    today = date_cls.today()
+    for g in snapshot.games:
+        if g.game_date < today:
+            continue  # don't paper-trade games already played
+        home_id = abbr_to_team_id.get(g.home_team_abbr)
+        away_id = abbr_to_team_id.get(g.away_team_abbr)
+        if home_id is None or away_id is None:
+            continue
+        upcoming_rows.append(
+            {
+                "game_id": g.slug,
+                "game_date": g.game_date.isoformat(),
+                "home_team_id": home_id,
+                "away_team_id": away_id,
+                "home_team_code": g.home_team_abbr,
+                "away_team_code": g.away_team_abbr,
+                "market_odds": -110,
+            }
+        )
+    if not upcoming_rows:
+        print("No future-dated Polymarket games to evaluate.")
+        return
+
+    upcoming = pl.DataFrame(upcoming_rows)
+    engine = AdvancedModelingEngine(
+        auto_train=True, use_trained_model=True, apply_injury_adjustment=False
+    )
+    projections = engine.generate_projections(upcoming)
+    annotated = compute_polymarket_edges(snapshot, projections)
+
+    journal = PaperTradeJournal()
+    inserted = 0
+    skipped = 0
+    for r in annotated.to_dicts():
+        slug = r.get("polymarket_slug")
+        gd_str = str(r.get("game_date", ""))[:10]
+        home = r.get("home_team_code", "")
+        away = r.get("away_team_code", "")
+        model_p = r.get("home_win_prob")
+        ph = r.get("polymarket_home_price")
+        pa = r.get("polymarket_away_price")
+        if slug is None or model_p is None or ph is None or pa is None:
+            continue
+
+        candidates = [
+            ("home", float(model_p), float(ph), float(model_p) - float(ph)),
+            ("away", 1.0 - float(model_p), float(pa), (1.0 - float(model_p)) - float(pa)),
+        ]
+        for side, prob, price, edge in candidates:
+            if edge < threshold:
+                continue
+            trade = PaperTrade(
+                venue="polymarket",
+                game_id=slug,
+                game_date=gd_str,
+                home_team_abbr=home,
+                away_team_abbr=away,
+                side=side,
+                model_prob=prob,
+                market_price=price,
+                edge=edge,
+            )
+            if journal.append(trade):
+                inserted += 1
+                print(
+                    f"  [{slug}] bet {side} @ {price:.3f} (model {prob:.3f}, edge +{edge:.3f})"
+                )
+            else:
+                skipped += 1
+
+    print()
+    print(f"Inserted {inserted} new trades; skipped {skipped} duplicates.")
+
+
+def settle() -> None:
+    """Look up outcomes for past-dated open trades and write realized PnL."""
+    from datetime import date as date_cls
+
+    from src.data.journal import PaperTradeJournal, yes_pnl
+    from src.data.outcome_lookup import fetch_outcomes_for_dates
+
+    journal = PaperTradeJournal()
+    today_iso = date_cls.today().isoformat()
+    open_trades = journal.list_open_past_games(today_iso)
+    if not open_trades:
+        print("No open trades on past-dated games.")
+        return
+
+    target_dates = sorted({date_cls.fromisoformat(t.game_date) for t in open_trades})
+    print(f"Looking up {len(target_dates)} game date(s) for {len(open_trades)} open trade(s)...")
+    outcomes = fetch_outcomes_for_dates(target_dates)
+    print(f"Fetched {len(outcomes)} game outcomes.")
+
+    settled = 0
+    for t in open_trades:
+        key = (t.home_team_abbr, t.away_team_abbr, t.game_date)
+        outcome = outcomes.get(key)
+        if outcome is None:
+            print(f"  unresolved: {t.game_id} ({t.away_team_abbr} @ {t.home_team_abbr} on {t.game_date})")
+            continue
+        side_won = outcome.home_won if t.side == "home" else not outcome.home_won
+        pnl = yes_pnl(t.market_price, side_won)
+        journal.mark_settled(
+            trade_id=t.id, home_won=outcome.home_won, side_won=side_won, realized_pnl=pnl
+        )
+        settled += 1
+        result = "WIN" if side_won else "loss"
+        print(
+            f"  {result}: {t.game_id} bet {t.side} @ {t.market_price:.3f} -> pnl {pnl:+.3f}"
+        )
+    print()
+    print(f"Settled {settled} trades.")
+
+
+def pnl_report() -> None:
+    """Cumulative ROI and edge-bucket breakdown over the settled journal."""
+    from src.data.journal import PaperTradeJournal
+
+    settled = PaperTradeJournal().list_settled()
+    if not settled:
+        print("No settled trades yet. Run sports-paper-trade then sports-settle.")
+        return
+
+    total_stake = sum(t.stake for t in settled)
+    total_pnl = sum((t.realized_pnl or 0) * t.stake for t in settled)
+    wins = sum(1 for t in settled if (t.realized_pnl or 0) > 0)
+    roi = total_pnl / total_stake if total_stake else 0.0
+
+    print(f"Settled trades: {len(settled)}")
+    print(f"Total stake:    ${total_stake:.2f}")
+    print(f"Total PnL:      ${total_pnl:+.2f}")
+    print(f"ROI:            {roi*100:+.2f}%")
+    print(f"Win rate:       {wins/len(settled):.3f}")
+    print()
+
+    print("By edge bucket:")
+    print(f"  {'edge>=':>6}  {'edge<':>6}  {'n':>4}  {'roi':>8}  {'win_rate':>9}")
+    buckets = [(0.0, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 1.0)]
+    for lo, hi in buckets:
+        sub = [t for t in settled if lo <= t.edge < hi]
+        if not sub:
+            continue
+        s_stake = sum(t.stake for t in sub)
+        s_pnl = sum((t.realized_pnl or 0) * t.stake for t in sub)
+        s_wr = sum(1 for t in sub if (t.realized_pnl or 0) > 0) / len(sub)
+        print(
+            f"  {lo:>6.2f}  {hi:>6.2f}  {len(sub):>4}  "
+            f"{(s_pnl/s_stake)*100:>+7.2f}%  {s_wr:>9.3f}"
+        )
+    print()
+    print("By venue:")
+    venues = sorted({t.venue for t in settled})
+    for v in venues:
+        sub = [t for t in settled if t.venue == v]
+        s_stake = sum(t.stake for t in sub)
+        s_pnl = sum((t.realized_pnl or 0) * t.stake for t in sub)
+        print(
+            f"  {v:<12}  {len(sub):>4} bets, ${s_pnl:+.2f} pnl on ${s_stake:.2f} stake "
+            f"({(s_pnl/s_stake)*100:+.2f}% ROI)"
+        )
+
+
 def test() -> None:
     """Run the unittest suite."""
     suite = unittest.defaultTestLoader.discover("tests")
@@ -377,6 +567,12 @@ if __name__ == "__main__":
         kalshi()
     elif command == "polymarket":
         polymarket()
+    elif command == "paper-trade":
+        paper_trade()
+    elif command == "settle":
+        settle()
+    elif command == "pnl":
+        pnl_report()
     elif command == "test":
         test()
     else:
