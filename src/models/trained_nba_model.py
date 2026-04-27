@@ -10,8 +10,71 @@ import numpy as np
 import pandas as pd
 import polars as pl
 from nba_api.stats.endpoints import leaguegamefinder, leaguegamelog
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
 from xgboost import XGBRegressor
+
+
+class PlattCalibrator:
+    """Two-parameter sigmoid calibration on raw probabilities.
+
+    Robust on small calibration sets where non-parametric isotonic
+    regression overfits step-function jumps.
+    """
+
+    def __init__(self) -> None:
+        self._lr: LogisticRegression | None = None
+
+    def fit(self, raw_prob: np.ndarray, y: np.ndarray) -> "PlattCalibrator":
+        self._lr = LogisticRegression()
+        self._lr.fit(np.asarray(raw_prob).reshape(-1, 1), np.asarray(y))
+        return self
+
+    def predict(self, raw_prob: np.ndarray) -> np.ndarray:
+        if self._lr is None:
+            raise RuntimeError("PlattCalibrator must be fit before calling predict.")
+        return self._lr.predict_proba(np.asarray(raw_prob).reshape(-1, 1))[:, 1]
+
+
+class TemperatureCalibrator:
+    """Single-parameter logit rescaling on raw probabilities.
+
+    Multiplies the input logit by a learned scale before re-applying
+    sigmoid: ``p_calibrated = sigmoid(scale * logit(p_raw))``. Scale
+    < 1 softens overconfidence at the tails; scale > 1 sharpens. With
+    only one fitted parameter this is much harder to overfit on small
+    calibration sets than Platt's two or isotonic's many — appropriate
+    when the bias has a smooth, monotonic shape.
+    """
+
+    def __init__(self) -> None:
+        self.scale: float = 1.0
+
+    def fit(self, raw_prob: np.ndarray, y: np.ndarray) -> "TemperatureCalibrator":
+        from scipy.optimize import minimize_scalar
+
+        prob = np.clip(np.asarray(raw_prob, dtype=float), 1e-6, 1 - 1e-6)
+        logits = np.log(prob / (1.0 - prob))
+        target = np.asarray(y, dtype=float)
+
+        def neg_log_likelihood(scale: float) -> float:
+            adjusted = np.clip(
+                1.0 / (1.0 + np.exp(-logits * scale)), 1e-6, 1 - 1e-6
+            )
+            return -float(
+                np.mean(target * np.log(adjusted) + (1 - target) * np.log(1 - adjusted))
+            )
+
+        result = minimize_scalar(
+            neg_log_likelihood, bounds=(0.05, 5.0), method="bounded"
+        )
+        self.scale = float(result.x)
+        return self
+
+    def predict(self, raw_prob: np.ndarray) -> np.ndarray:
+        prob = np.clip(np.asarray(raw_prob, dtype=float), 1e-6, 1 - 1e-6)
+        logits = np.log(prob / (1.0 - prob))
+        return 1.0 / (1.0 + np.exp(-logits * self.scale))
 
 
 @dataclass
@@ -23,6 +86,7 @@ class ModelArtifacts:
     trained_at: str
     margin_model: XGBRegressor
     total_model: XGBRegressor
+    win_prob_calibrator: TemperatureCalibrator | None = None
 
 
 class NBAModelManager:
@@ -59,6 +123,7 @@ class NBAModelManager:
     def load_artifacts(self) -> ModelArtifacts | None:
         if self.artifact_path.exists():
             payload = joblib.load(self.artifact_path)
+            payload.setdefault("win_prob_calibrator", None)
             self.artifacts = ModelArtifacts(**payload)
         return self.artifacts
 
@@ -539,6 +604,11 @@ class NBAModelManager:
             "test_rows": float(len(test_df)),
         }
 
+        # Win-probability calibration was tested via sports-backtest and did not
+        # improve any metric (raw Brier 0.2156 vs calibrated 0.22+ at every
+        # holdout size). Calibrator slot is kept as None so the artifact schema
+        # can support it later if cross-validated calibration becomes worth
+        # building. predict_games falls back to the default logistic mapping.
         self.artifact_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "feature_names": feature_names,
@@ -548,10 +618,17 @@ class NBAModelManager:
             "trained_at": datetime.now(timezone.utc).isoformat(),
             "margin_model": margin_model,
             "total_model": total_model,
+            "win_prob_calibrator": None,
         }
         joblib.dump(payload, self.artifact_path)
         self.artifacts = ModelArtifacts(**payload)
         return self.artifacts
+
+    @staticmethod
+    def _fit_win_prob_calibrator(
+        raw_prob: np.ndarray, actual_home_win: np.ndarray
+    ) -> TemperatureCalibrator:
+        return TemperatureCalibrator().fit(raw_prob, actual_home_win)
 
     def walk_forward_evaluate(
         self,
@@ -852,6 +929,8 @@ class NBAModelManager:
         vig: float = 0.0476,
         edge_thresholds: list[float] | None = None,
         n_calibration_buckets: int = 10,
+        apply_calibration: bool = True,
+        calibration_holdout: int = 100,
     ) -> dict[str, Any]:
         """Walk-forward backtest against a synthetic uniform -110 market.
 
@@ -905,13 +984,33 @@ class NBAModelManager:
             if len(train_df) < min_train_size or test_df.empty:
                 continue
 
-            X_train = train_df[feature_names].fillna(feature_defaults)
             X_test = test_df[feature_names].fillna(feature_defaults)
 
             margin_model = self._new_xgb_regressor()
-            margin_model.fit(X_train, train_df["target_margin"])
-            predicted_margin = margin_model.predict(X_test)
-            predicted_home_prob = self._margin_to_home_win_prob(predicted_margin)
+            calibrator: TemperatureCalibrator | None = None
+            if (
+                apply_calibration
+                and len(train_df) >= min_train_size + calibration_holdout
+            ):
+                inner_train = train_df.iloc[:-calibration_holdout]
+                calib_df = train_df.iloc[-calibration_holdout:]
+                X_inner = inner_train[feature_names].fillna(feature_defaults)
+                X_calib = calib_df[feature_names].fillna(feature_defaults)
+                margin_model.fit(X_inner, inner_train["target_margin"])
+                calib_raw_prob = self._margin_to_home_win_prob(
+                    margin_model.predict(X_calib)
+                )
+                calib_actual = (calib_df["target_margin"].to_numpy() > 0).astype(int)
+                calibrator = self._fit_win_prob_calibrator(calib_raw_prob, calib_actual)
+            else:
+                X_train = train_df[feature_names].fillna(feature_defaults)
+                margin_model.fit(X_train, train_df["target_margin"])
+
+            raw_prob = self._margin_to_home_win_prob(margin_model.predict(X_test))
+            if calibrator is not None:
+                predicted_home_prob = calibrator.predict(raw_prob)
+            else:
+                predicted_home_prob = raw_prob
             predicted_home_prob = np.clip(predicted_home_prob, 1e-6, 1 - 1e-6)
             actual_home_win = (test_df["target_margin"].to_numpy() > 0).astype(int)
 
@@ -997,6 +1096,7 @@ class NBAModelManager:
             "vig": vig,
             "breakeven_prob": breakeven,
             "win_payout": win_payout,
+            "applied_calibration": apply_calibration,
             "accuracy_mean": float(np.mean([f["accuracy"] for f in per_fold])),
             "accuracy_std": float(np.std([f["accuracy"] for f in per_fold], ddof=1))
             if len(per_fold) > 1 else 0.0,
@@ -1033,5 +1133,11 @@ class NBAModelManager:
         feature_df["model_trained_at"] = artifacts.trained_at
         feature_df["model_margin_mae"] = artifacts.metrics.get("margin_mae")
         feature_df["model_total_mae"] = artifacts.metrics.get("total_mae")
+
+        if artifacts.win_prob_calibrator is not None:
+            raw_prob = self._margin_to_home_win_prob(margin_pred)
+            feature_df["home_win_prob_calibrated"] = artifacts.win_prob_calibrator.predict(
+                raw_prob
+            )
 
         return pl.DataFrame(feature_df.to_dict(orient="records"))

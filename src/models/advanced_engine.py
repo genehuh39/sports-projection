@@ -115,13 +115,18 @@ class AdvancedModelingEngine:
                     "expected_margin"
                 )
             ]
-        ).with_columns(
-            [
+        )
+
+        if "home_win_prob_calibrated" in projections.columns:
+            projections = projections.with_columns(
+                pl.col("home_win_prob_calibrated").alias("home_win_prob")
+            )
+        else:
+            projections = projections.with_columns(
                 (1.0 / (1.0 + (-pl.col("expected_margin") / 8.0).exp())).alias(
                     "home_win_prob"
                 )
-            ]
-        )
+            )
 
         return projections
 
