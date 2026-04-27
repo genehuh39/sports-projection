@@ -340,6 +340,212 @@ class BacktestTests(unittest.TestCase):
         self.assertAlmostEqual(results["breakeven_prob"], 0.5238, places=3)
 
 
+class KalshiProviderTests(unittest.TestCase):
+    def test_event_ticker_parser(self):
+        from src.data.kalshi_provider import _parse_event_ticker
+        from datetime import date
+
+        self.assertEqual(
+            _parse_event_ticker("KXNBAGAME-26APR29HOULAL"),
+            (date(2026, 4, 29), "HOU", "LAL"),
+        )
+        self.assertEqual(
+            _parse_event_ticker("KXNBAGAME-26MAY01CLETOR"),
+            (date(2026, 5, 1), "CLE", "TOR"),
+        )
+        self.assertIsNone(_parse_event_ticker("not-a-ticker"))
+        self.assertIsNone(_parse_event_ticker("KXNBAGAME-26FOO29HOULAL"))  # bad month
+
+    def test_provider_assembles_games_from_mocked_payloads(self):
+        from src.data import kalshi_provider as kp
+        from datetime import date
+
+        provider = kp.KalshiProvider()
+        events_payload = {
+            "events": [
+                {
+                    "event_ticker": "KXNBAGAME-26APR29HOULAL",
+                    "title": "Game 5: Houston at LAL",
+                }
+            ],
+            "cursor": None,
+        }
+        markets_payload = {
+            "markets": [
+                {
+                    "ticker": "KXNBAGAME-26APR29HOULAL-LAL",
+                    "event_ticker": "KXNBAGAME-26APR29HOULAL",
+                    "yes_bid": 60, "yes_ask": 62, "volume": 12000,
+                },
+                {
+                    "ticker": "KXNBAGAME-26APR29HOULAL-HOU",
+                    "event_ticker": "KXNBAGAME-26APR29HOULAL",
+                    "yes_bid": 38, "yes_ask": 40, "volume": 12000,
+                },
+            ]
+        }
+
+        def fake_get(path: str, params=None):
+            if path == "/events":
+                return events_payload
+            if path == "/markets":
+                return markets_payload
+            raise AssertionError(f"unexpected path {path}")
+
+        provider._get = fake_get  # type: ignore[assignment]
+        snap = provider.fetch()
+        self.assertEqual(snap.source, "kalshi")
+        self.assertEqual(len(snap.games), 1)
+        g = snap.games[0]
+        self.assertEqual(g.home_team_abbr, "LAL")
+        self.assertEqual(g.away_team_abbr, "HOU")
+        self.assertEqual(g.game_date, date(2026, 4, 29))
+        self.assertAlmostEqual(g.home_yes_ask, 0.62)
+        self.assertAlmostEqual(g.away_yes_ask, 0.40)
+
+    def test_compute_kalshi_edges_matches_and_computes(self):
+        from src.data.kalshi_provider import (
+            KalshiGameMarket,
+            KalshiSnapshot,
+            compute_kalshi_edges,
+        )
+        from datetime import date
+
+        snapshot = KalshiSnapshot(
+            games=[
+                KalshiGameMarket(
+                    event_ticker="KXNBAGAME-26APR29HOULAL",
+                    game_date=date(2026, 4, 29),
+                    home_team_abbr="LAL",
+                    away_team_abbr="HOU",
+                    home_market_ticker="KXNBAGAME-26APR29HOULAL-LAL",
+                    away_market_ticker="KXNBAGAME-26APR29HOULAL-HOU",
+                    home_yes_bid=0.60,
+                    home_yes_ask=0.62,
+                    away_yes_bid=0.38,
+                    away_yes_ask=0.40,
+                )
+            ],
+            source="kalshi",
+        )
+        games = pl.DataFrame(
+            [
+                {
+                    "home_team_code": "LAL",
+                    "away_team_code": "HOU",
+                    "game_date": "2026-04-29",
+                    "home_win_prob": 0.70,
+                },
+                {
+                    "home_team_code": "BOS",  # no Kalshi match
+                    "away_team_code": "MIA",
+                    "game_date": "2026-04-29",
+                    "home_win_prob": 0.55,
+                },
+            ]
+        )
+        out = compute_kalshi_edges(snapshot, games)
+        rows = out.to_dicts()
+        self.assertAlmostEqual(rows[0]["edge_home"], 0.70 - 0.62)
+        self.assertAlmostEqual(rows[0]["edge_away"], (1 - 0.70) - 0.40)
+        self.assertEqual(rows[0]["kalshi_event_ticker"], "KXNBAGAME-26APR29HOULAL")
+        self.assertIsNone(rows[1]["edge_home"])
+        self.assertIsNone(rows[1]["edge_away"])
+
+
+class PolymarketProviderTests(unittest.TestCase):
+    def test_slug_parser(self):
+        from src.data.polymarket_provider import _parse_nba_slug
+        from datetime import date
+
+        self.assertEqual(
+            _parse_nba_slug("nba-det-orl-2026-04-27"),
+            (date(2026, 4, 27), "DET", "ORL"),
+        )
+        self.assertEqual(
+            _parse_nba_slug("nba-min-den-2026-04-27"),
+            (date(2026, 4, 27), "MIN", "DEN"),
+        )
+        # Spread / totals slugs are skipped
+        self.assertIsNone(_parse_nba_slug("spread-pistons-3-5-2026-04-27"))
+        self.assertIsNone(_parse_nba_slug("nba-det-orl-2026-04-27-spread-3-5"))
+
+    def test_outcome_prices_accepts_string_or_list(self):
+        from src.data.polymarket_provider import _parse_outcome_prices
+
+        self.assertEqual(_parse_outcome_prices(["0.6", "0.4"]), [0.6, 0.4])
+        self.assertEqual(_parse_outcome_prices('["0.6", "0.4"]'), [0.6, 0.4])
+        self.assertIsNone(_parse_outcome_prices("not-json"))
+        self.assertIsNone(_parse_outcome_prices(None))
+
+    def test_provider_assembles_games_from_mocked_payload(self):
+        from src.data import polymarket_provider as pm
+        from datetime import date
+
+        provider = pm.PolymarketProvider()
+        provider._list_active_markets = lambda: [  # type: ignore[assignment]
+            {
+                "conditionId": "0xabc",
+                "slug": "nba-det-orl-2026-04-27",
+                "question": "Pistons vs. Magic",
+                "outcomes": '["Pistons", "Magic"]',
+                "outcomePrices": '["0.595", "0.405"]',
+                "volume24hr": 1000.0,
+            },
+            {
+                "slug": "spread-pistons-3-5-2026-04-27",  # filtered out
+                "outcomePrices": '["0.5", "0.5"]',
+            },
+        ]
+        snap = provider.fetch()
+        self.assertEqual(len(snap.games), 1)
+        g = snap.games[0]
+        self.assertEqual(g.home_team_abbr, "ORL")
+        self.assertEqual(g.away_team_abbr, "DET")
+        self.assertEqual(g.game_date, date(2026, 4, 27))
+        self.assertAlmostEqual(g.home_yes_ask, 0.405)
+        self.assertAlmostEqual(g.away_yes_ask, 0.595)
+
+    def test_compute_polymarket_edges(self):
+        from src.data.polymarket_provider import (
+            PolymarketGameMarket,
+            PolymarketSnapshot,
+            compute_polymarket_edges,
+        )
+        from datetime import date
+
+        snapshot = PolymarketSnapshot(
+            games=[
+                PolymarketGameMarket(
+                    market_id="m1",
+                    slug="nba-det-orl-2026-04-27",
+                    game_date=date(2026, 4, 27),
+                    home_team_abbr="ORL",
+                    away_team_abbr="DET",
+                    home_yes_bid=0.405,
+                    home_yes_ask=0.405,
+                    away_yes_bid=0.595,
+                    away_yes_ask=0.595,
+                )
+            ],
+            source="polymarket",
+        )
+        games = pl.DataFrame(
+            [
+                {
+                    "home_team_code": "ORL",
+                    "away_team_code": "DET",
+                    "game_date": "2026-04-27",
+                    "home_win_prob": 0.323,
+                }
+            ]
+        )
+        out = compute_polymarket_edges(snapshot, games)
+        row = out.to_dicts()[0]
+        self.assertAlmostEqual(row["edge_home_pm"], 0.323 - 0.405)
+        self.assertAlmostEqual(row["edge_away_pm"], (1 - 0.323) - 0.595)
+
+
 class HistoricalPointsAbsentTests(unittest.TestCase):
     def test_top_n_scorer_missing_counts_their_ppg(self):
         from src.models.trained_nba_model import NBAModelManager
