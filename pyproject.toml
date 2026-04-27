@@ -33,6 +33,7 @@ sports-train = "src.cli:train"
 sports-eval = "src.cli:evaluate"
 sports-calibrate = "src.cli:calibrate"
 sports-backtest = "src.cli:backtest"
+sports-kalshi = "src.cli:kalshi"
 sports-test = "src.cli:test"
 
 [tool.setuptools.packages.find]
