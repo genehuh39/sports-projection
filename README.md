@@ -40,6 +40,11 @@ uv sync
 | `uv run sports-eval`       | Walk-forward CV over 6 folds, reports per-fold and aggregate MAE |
 | `uv run sports-calibrate`  | Sweeps injury damping factors against historical box scores |
 | `uv run sports-backtest`   | Calibration metrics (Brier, log loss, accuracy) + synthetic-market ROI by edge |
+| `uv run sports-kalshi`     | Compare model probabilities against live Kalshi NBA game prices |
+| `uv run sports-polymarket` | Compare model probabilities against live Polymarket NBA game prices |
+| `uv run sports-paper-trade [edge]` | Log "would have placed" entries above edge threshold (default 0.05) |
+| `uv run sports-settle`     | Resolve past-dated open paper trades against actual game outcomes |
+| `uv run sports-pnl`        | Cumulative ROI, win rate, edge-bucket and venue breakdown over the journal |
 | `uv run sports-test`       | Test suite |
 
 `sports-eval` and `sports-calibrate` accept positional args, e.g. `uv run sports-eval 8 100` for 8 folds × 100 games each.
@@ -67,6 +72,35 @@ For each upcoming game, the projection engine builds per-team pregame features a
 
 The ±0.59 std is the noise floor — any future change smaller than ~1.2 margin points (2σ) is statistically indistinguishable.
 
+## Prediction-market integration
+
+The project ships read-only clients for both Kalshi (`KXNBAGAME` series) and Polymarket (gamma API) NBA game markets. For each upcoming game the model has an opinion on, it pulls the venue's price and computes per-side edge.
+
+Empirical liquidity finding (April 2026):
+
+| | Kalshi | Polymarket |
+|---|---|---|
+| Events listed | All upcoming NBA games | All upcoming NBA games |
+| Markets with quotes | **0** | **All**, six-figure 24h volumes |
+
+Kalshi NBA game-line markets are essentially empty right now. Polymarket has real prices, real volume, and is the venue worth measuring against today.
+
+### Paper-trading workflow
+
+Three commands form a daily loop for measuring the model against live prices without placing real money:
+
+```bash
+uv run sports-paper-trade 0.05    # nightly: log positive-edge bets above 5%
+uv run sports-settle              # any time: resolve past games
+uv run sports-pnl                 # report cumulative results
+```
+
+Trades are stored in a local SQLite journal (`data/paper_trades.db`, gitignored). PnL accounting follows prediction-market conventions: a YES contract bought at price `p` returns `(1-p)/p` if it wins, `-1.0` if it loses.
+
+The `(venue, game_id, side)` uniqueness constraint makes `sports-paper-trade` idempotent — re-running it the same day appends only new entries. `sports-settle` looks up actual outcomes via `nba_api.leaguegamefinder` (regular season + playoffs) and writes realized PnL.
+
+This is where the project genuinely answers "does this model make money?" — a question that's unanswerable by MAE alone and unsupported by historical odds APIs. Run it nightly, settle daily, and after a few hundred bets the answer becomes statistical.
+
 ## Dashboard
 
 Filters: positive-EV only, minimum edge %, odds source, game date.
@@ -93,7 +127,11 @@ src/
 ├── data/
 │   ├── nba_fetcher.py        live schedule + odds + team form
 │   ├── odds_providers.py     ESPN / DraftKings / The Odds API
-│   └── injury_provider.py    ESPN injury feed → per-team points absent
+│   ├── injury_provider.py    ESPN injury feed → per-team points absent
+│   ├── kalshi_provider.py    Kalshi NBA-game-market REST client
+│   ├── polymarket_provider.py Polymarket gamma API client
+│   ├── outcome_lookup.py     leaguegamefinder lookup for paper-trade settlement
+│   └── journal.py            SQLite-backed paper-trade journal
 ├── models/
 │   ├── advanced_engine.py    projection engine, applies adjustments
 │   ├── trained_nba_model.py  feature engineering, training, CV, calibration
