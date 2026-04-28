@@ -175,10 +175,8 @@ def kalshi() -> None:
     for every market Kalshi has open, independent of nba_api scheduling
     quirks.
     """
-    import polars as pl
-    from nba_api.stats.static import teams as nba_static_teams
-
     from src.data.kalshi_provider import KalshiProvider, compute_kalshi_edges
+    from src.data.upcoming import build_upcoming_from_market_games
     from src.models.advanced_engine import AdvancedModelingEngine
 
     snapshot = KalshiProvider().fetch()
@@ -188,30 +186,12 @@ def kalshi() -> None:
         )
         return
 
-    abbr_to_team_id = {
-        t["abbreviation"]: int(t["id"]) for t in nba_static_teams.get_teams()
-    }
-    upcoming_rows = []
-    for g in snapshot.games:
-        home_id = abbr_to_team_id.get(g.home_team_abbr)
-        away_id = abbr_to_team_id.get(g.away_team_abbr)
-        if home_id is None or away_id is None:
-            continue
-        upcoming_rows.append(
-            {
-                "game_id": g.event_ticker,
-                "game_date": g.game_date.isoformat(),
-                "home_team_id": home_id,
-                "away_team_id": away_id,
-                "home_team_code": g.home_team_abbr,
-                "away_team_code": g.away_team_abbr,
-                "market_odds": -110,
-            }
-        )
-    if not upcoming_rows:
+    upcoming = build_upcoming_from_market_games(
+        snapshot.games, id_attr="event_ticker"
+    )
+    if upcoming.is_empty():
         print("Kalshi events returned but no NBA team-abbreviation matches.")
         return
-    upcoming = pl.DataFrame(upcoming_rows)
 
     engine = AdvancedModelingEngine(
         auto_train=True, use_trained_model=True, apply_injury_adjustment=False
@@ -264,13 +244,11 @@ def kalshi() -> None:
 
 def polymarket() -> None:
     """Compare model probabilities against live Polymarket NBA prices."""
-    import polars as pl
-    from nba_api.stats.static import teams as nba_static_teams
-
     from src.data.polymarket_provider import (
         PolymarketProvider,
         compute_polymarket_edges,
     )
+    from src.data.upcoming import build_upcoming_from_market_games
     from src.models.advanced_engine import AdvancedModelingEngine
 
     snapshot = PolymarketProvider().fetch()
@@ -280,30 +258,10 @@ def polymarket() -> None:
         )
         return
 
-    abbr_to_team_id = {
-        t["abbreviation"]: int(t["id"]) for t in nba_static_teams.get_teams()
-    }
-    upcoming_rows = []
-    for g in snapshot.games:
-        home_id = abbr_to_team_id.get(g.home_team_abbr)
-        away_id = abbr_to_team_id.get(g.away_team_abbr)
-        if home_id is None or away_id is None:
-            continue
-        upcoming_rows.append(
-            {
-                "game_id": g.slug,
-                "game_date": g.game_date.isoformat(),
-                "home_team_id": home_id,
-                "away_team_id": away_id,
-                "home_team_code": g.home_team_abbr,
-                "away_team_code": g.away_team_abbr,
-                "market_odds": -110,
-            }
-        )
-    if not upcoming_rows:
+    upcoming = build_upcoming_from_market_games(snapshot.games, id_attr="slug")
+    if upcoming.is_empty():
         print("Polymarket markets returned but no NBA team-abbreviation matches.")
         return
-    upcoming = pl.DataFrame(upcoming_rows)
 
     engine = AdvancedModelingEngine(
         auto_train=True, use_trained_model=True, apply_injury_adjustment=False
@@ -358,15 +316,12 @@ def paper_trade() -> None:
     For each market with edge > threshold (default 0.05) on either side,
     inserts a journal entry. Idempotent per (venue, game_id, side).
     """
-    import polars as pl
-    from datetime import date as date_cls
-    from nba_api.stats.static import teams as nba_static_teams
-
     from src.data.journal import PaperTrade, PaperTradeJournal
     from src.data.polymarket_provider import (
         PolymarketProvider,
         compute_polymarket_edges,
     )
+    from src.data.upcoming import build_upcoming_from_market_games
     from src.models.advanced_engine import AdvancedModelingEngine
 
     threshold = float(sys.argv[2]) if len(sys.argv) > 2 else 0.05
@@ -376,37 +331,20 @@ def paper_trade() -> None:
         print("Polymarket returned no NBA markets.")
         return
 
-    abbr_to_team_id = {
-        t["abbreviation"]: int(t["id"]) for t in nba_static_teams.get_teams()
-    }
-    upcoming_rows = []
-    today = date_cls.today()
-    for g in snapshot.games:
-        if g.game_date < today:
-            continue  # don't paper-trade games already played
-        home_id = abbr_to_team_id.get(g.home_team_abbr)
-        away_id = abbr_to_team_id.get(g.away_team_abbr)
-        if home_id is None or away_id is None:
-            continue
-        upcoming_rows.append(
-            {
-                "game_id": g.slug,
-                "game_date": g.game_date.isoformat(),
-                "home_team_id": home_id,
-                "away_team_id": away_id,
-                "home_team_code": g.home_team_abbr,
-                "away_team_code": g.away_team_abbr,
-                "market_odds": -110,
-            }
-        )
-    if not upcoming_rows:
+    upcoming = build_upcoming_from_market_games(
+        snapshot.games, id_attr="slug", future_only=True
+    )
+    if upcoming.is_empty():
         print("No future-dated Polymarket games to evaluate.")
         return
 
-    upcoming = pl.DataFrame(upcoming_rows)
+    # Reuse the saved artifact if available; only retrain when missing.
+    # Nightly cron should not pay the full retrain cost on every run.
     engine = AdvancedModelingEngine(
-        auto_train=True, use_trained_model=True, apply_injury_adjustment=False
+        auto_train=False, use_trained_model=True, apply_injury_adjustment=False
     )
+    if engine.model_manager.ensure_artifacts() is None:
+        engine.model_manager.auto_train = True
     projections = engine.generate_projections(upcoming)
     annotated = compute_polymarket_edges(snapshot, projections)
 
@@ -494,7 +432,7 @@ def settle() -> None:
     print(f"Settled {settled} trades.")
 
 
-def pnl_report() -> None:
+def pnl() -> None:
     """Cumulative ROI and edge-bucket breakdown over the settled journal."""
     from src.data.journal import PaperTradeJournal
 
@@ -572,7 +510,7 @@ if __name__ == "__main__":
     elif command == "settle":
         settle()
     elif command == "pnl":
-        pnl_report()
+        pnl()
     elif command == "test":
         test()
     else:

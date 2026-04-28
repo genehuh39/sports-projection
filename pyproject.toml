@@ -37,7 +37,7 @@ sports-kalshi = "src.cli:kalshi"
 sports-polymarket = "src.cli:polymarket"
 sports-paper-trade = "src.cli:paper_trade"
 sports-settle = "src.cli:settle"
-sports-pnl = "src.cli:pnl_report"
+sports-pnl = "src.cli:pnl"
 sports-test = "src.cli:test"
 
 [tool.setuptools.packages.find]

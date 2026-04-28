@@ -9,6 +9,14 @@ from typing import Iterator, Optional
 
 DEFAULT_JOURNAL_PATH = Path("data/paper_trades.db")
 
+# String constants used as enum-like values in the SQLite schema.
+SIDE_HOME = "home"
+SIDE_AWAY = "away"
+STATUS_OPEN = "open"
+STATUS_SETTLED = "settled"
+VENUE_KALSHI = "kalshi"
+VENUE_POLYMARKET = "polymarket"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +57,7 @@ class PaperTrade:
     notes: str = ""
     id: Optional[int] = None
     created_at: Optional[str] = None
-    status: str = "open"
+    status: str = STATUS_OPEN
     home_won: Optional[int] = None
     side_won: Optional[int] = None
     realized_pnl: Optional[float] = None
@@ -85,31 +93,27 @@ class PaperTradeJournal:
             conn.close()
 
     def append(self, trade: PaperTrade) -> bool:
-        """Insert a new trade. Returns True if inserted, False if a trade for
-        the same (venue, game_id, side) already exists."""
+        """Returns True if inserted, False if (venue, game_id, side) is a duplicate."""
         created_at = trade.created_at or datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO paper_trades (
-                        created_at, venue, game_id, game_date,
-                        home_team_abbr, away_team_abbr, side,
-                        model_prob, market_price, edge, stake,
-                        status, notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        created_at, trade.venue, trade.game_id, trade.game_date,
-                        trade.home_team_abbr, trade.away_team_abbr, trade.side,
-                        float(trade.model_prob), float(trade.market_price),
-                        float(trade.edge), float(trade.stake),
-                        trade.status, trade.notes,
-                    ),
-                )
-                return True
-            except sqlite3.IntegrityError:
-                return False
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO paper_trades (
+                    created_at, venue, game_id, game_date,
+                    home_team_abbr, away_team_abbr, side,
+                    model_prob, market_price, edge, stake,
+                    status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at, trade.venue, trade.game_id, trade.game_date,
+                    trade.home_team_abbr, trade.away_team_abbr, trade.side,
+                    float(trade.model_prob), float(trade.market_price),
+                    float(trade.edge), float(trade.stake),
+                    trade.status, trade.notes,
+                ),
+            )
+            return cursor.rowcount > 0
 
     def list_open_past_games(self, today_iso: str) -> list[PaperTrade]:
         with self._connect() as conn:
