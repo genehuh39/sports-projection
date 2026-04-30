@@ -50,3 +50,5 @@ artifacts/
 # UV
 .uv/
 
+# Paper-trade journal (top-level data dir only; not src/data/)
+/data/
