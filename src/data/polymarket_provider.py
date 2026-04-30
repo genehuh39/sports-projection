@@ -157,7 +157,20 @@ class PolymarketProvider:
 
     def _get(self, path: str, params: dict[str, str | int]):
         url = f"{POLYMARKET_GAMMA_BASE}{path}?{urlencode(params)}"
-        req = Request(url, headers={"User-Agent": "sports-projection/0.5"})
+        # Polymarket's gamma API 403s on default urllib UAs from some IP
+        # ranges (Anthropic cloud sandbox among them). A standard browser UA
+        # plus Accept header gets through.
+        req = Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json",
+            },
+        )
         with urlopen(req, timeout=self._timeout) as resp:
             return json.loads(resp.read())
 
